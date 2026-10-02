@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>标签组管理</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <!-- t0:静态壳,同步渲染,不等待任何 storage / API -->
+  <nav class="tabbar" id="tabbar">
+    <button class="tab active" data-tab="current" id="tab-current">当前标签</button>
+    <button class="tab" data-tab="records" id="tab-records">快照记录</button>
+  </nav>
+
+  <header class="header" id="header">
+    <div class="title-group">
+      <h1 class="title" id="header-title">当前标签</h1>
+      <!-- 展开/折叠全部标签组(紧邻主标题右方;hover 提示见 setHeader) -->
+      <button class="icon-btn fold-all" id="btn-fold-all" aria-label="展开/收起全部"></button>
+      <span class="subtitle" id="header-sub">(当前窗口中的所有标签和分组)</span>
+    </div>
+    <!-- 当前标签 tab:捕获全部(补充需求1) -->
+    <div class="actions" id="capture-all-wrap">
+      <button class="text-btn" id="btn-capture-all">捕获全部</button>
+    </div>
+    <!-- 快照记录 tab:纯文本导出/导入(补充需求2) -->
+    <div class="actions" id="header-actions" hidden>
+      <button class="text-btn" id="btn-export">导出</button>
+      <button class="text-btn" id="btn-import">导入</button>
+      <input type="file" id="import-file" accept="application/json,.json" hidden />
+    </div>
+  </header>
+
+  <!-- 列表:t0 先渲染骨架,t1 异步填充 -->
+  <main class="list" id="list" tabindex="0"></main>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script type="module" src="src/popup.js"></script>
+</body>
+</html>

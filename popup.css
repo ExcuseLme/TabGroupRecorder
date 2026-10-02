@@ -1,0 +1,147 @@
+/* ===== 基础 ===== */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --w: 400px;
+  --blue: #2563eb;
+  --text: #1f2328;
+  --text-2: #6b7280;
+  --line: #eceef1;
+  --bg: #fafafb;
+  --row: #ffffff;
+  --cap-bg: #e9f6ec;
+  --cap-fg: #16794a;
+  --open-bg: #e9f6ec;
+  --del-bg: #fdecef;
+  --del-fg: #dc2626;
+  --icon: #6b7280;
+}
+html {
+  width: var(--w);           /* 固定宽度 400(切 tab 不变宽,位置稳定) */
+  height: auto;             /* 内容自然流(方案B):Chrome popup 视口由内容决定,写死/100vh 均会塌缩或溢出(P-32 教训) */
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  color: var(--text);
+  background: var(--bg);
+  font-size: 13px;
+}
+body {
+  width: var(--w);           /* 固定宽度,与 html 同 */
+  height: auto;             /* 随内容;高度由 .list 的 max-height 约束,不溢出 */
+  margin: 0;
+  display: flex; flex-direction: column;
+  overflow-x: hidden;
+}
+
+/* ===== Tab 栏 ===== */
+.tabbar { display: flex; gap: 4px; padding: 8px 12px; background: var(--bg); }
+.tab {
+  flex: 1; height: 32px; border: none; border-radius: 6px;
+  background: #eceef1; color: var(--text-2); font-size: 13px; cursor: pointer;
+}
+.tab.active { background: var(--blue); color: #fff; }
+
+/* ===== 页头 ===== */
+.header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; background: var(--row); border-bottom: 1px solid var(--line);
+}
+.title-group { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.title { font-size: 16px; font-weight: 600; white-space: nowrap; }
+/* 展开/折叠全部按钮:紧邻主标题右方;hover 提示用浏览器原生 title(见下,移除自绘 tip) */
+.title-group .fold-all { width: 22px; height: 22px; color: var(--text-2); }
+.title-group .fold-all:hover { background: #eef0f3; color: var(--text); }
+.subtitle { font-size: 11px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.actions { display: flex; gap: 8px; flex-shrink: 0; }
+.actions[hidden] { display: none; }
+/* 纯文本按钮(补充需求1、2) */
+.text-btn {
+  height: 26px; padding: 0 10px; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--row); color: var(--text);
+  font-size: 12px; cursor: pointer; white-space: nowrap;
+}
+.text-btn:hover { background: #f1f2f4; }
+.icon-btn {
+  width: 24px; height: 24px; display: grid; place-items: center;
+  border: none; border-radius: 6px; background: transparent; color: var(--icon);
+  cursor: pointer; position: relative;
+}
+.icon-btn:hover { background: #f1f2f4; }
+/* hover 提示使用浏览器原生 title(与列表行一致);已移除扩展自绘 ::after tip(P-31,双重 tip) */
+
+/* ===== 列表 ===== */
+.list {
+  flex: 1 1 auto;
+  min-height: 0;
+  /* 总内容 = tabbar+header+padding+此值 必须 ≤ popup 视口(实测 600)才不溢出(P-32 日志:560→总659>600 溢出)。
+     480 + 固定区约100 = 约580 < 600 → html 不溢出、外层无滚动条;列表内容多仍内部滚动 */
+  max-height: 480px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 8px 12px 12px;
+  background: var(--bg);
+}
+.list:focus { outline: none; }
+
+/* 骨架屏:仅在 .skeleton 容器内生效,渲染真实数据时已移除该 class */
+.skeleton .row-title::after {
+  content: ""; display: block; width: 60%; height: 12px; margin-top: 4px;
+  background: linear-gradient(90deg,#eee,#f5f5f5); border-radius: 4px;
+}
+
+/* 禁止双击选中文字(§问题4) */
+.row, .row-title, .state-icon { user-select: none; }
+.row-title[contenteditable="true"] { user-select: text; }
+
+/* 行 */
+.row {
+  display: flex; align-items: center; gap: 8px;
+  min-height: 44px; padding: 0 8px; margin-bottom: 2px;   /* 紧凑(新问题2) */
+  background: var(--row); border-radius: 6px;              /* 去边框(新问题2) */
+}
+.row:hover { background: #f4f5f7; }   /* 悬停轻提示替代边框分隔 */
+.row.child { min-height: 44px; padding-left: 40px; }  /* 子行与根行同高 */
+.dot { width: 20px; height: 20px; border-radius: 50%; flex-shrink: 0; background: #d1d5db; }
+/* 图标行(标签/组内标签):白底、仿参照扩展;标签组仍为圆形色块(P-26 方案B)
+   图标锁定为与容器等大的正方形 → 无论 favicon 原始比例如何,行高恒定一致 */
+.dot--img { background: #fff; }
+.row.child .dot { width: 16px; height: 16px; }
+.dot--img img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.row-main { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; }
+.row-title {
+  font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  cursor: text;
+}
+.row.child .row-title { font-size: 12px; }
+.row-title[contenteditable="true"] {
+  outline: 1px solid var(--blue); border-radius: 4px; cursor: text;
+  white-space: nowrap; overflow-x: auto; overflow-y: hidden;
+  text-overflow: clip;     /* 编辑态不显示省略号(其他问题2.2遗留) */
+  scrollbar-width: none;
+}
+.row-title[contenteditable="true"]::-webkit-scrollbar { display: none; }
+.row-tools { display: flex; gap: 6px; flex-shrink: 0; }
+
+/* 状态图标 <> / >< */
+.state-icon { flex-shrink: 0; color: var(--icon); display: grid; place-items: center; cursor: pointer; }
+.state-icon svg { display: block; }
+
+/* 按钮 */
+.btn {
+  height: 24px; padding: 0 9px; border: none; border-radius: 6px;
+  font-size: 11px; cursor: pointer; white-space: nowrap;
+}
+.btn.cap { background: var(--cap-bg); color: var(--cap-fg); }
+.btn.open { background: var(--open-bg); color: var(--cap-fg); }
+.btn.del { background: var(--del-bg); color: var(--del-fg); }
+.btn:disabled { opacity: .5; cursor: default; }
+
+/* 空态 */
+.empty { padding: 40px 16px; text-align: center; color: var(--text-2); font-size: 12px; }
+
+/* toast */
+.toast {
+  position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
+  background: #1f2328; color: #fff; font-size: 12px;
+  padding: 7px 12px; border-radius: 6px; max-width: 90%;
+  z-index: 50;
+}
