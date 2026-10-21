@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "标签组管理 (TabGroupRecorder)",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "极致轻量的标签组/标签快照工具:捕获、阅读、快速打开当前窗口的标签与分组,支持渐进加载与导入导出。",
   "minimum_chrome_version": "89",
   "action": {

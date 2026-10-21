@@ -7,8 +7,8 @@ A lightweight Chrome extension for capturing, browsing, and restoring browser ta
 ## Features
 
 - **Capture** the current window's tabs and tab groups as snapshots — one at a time or all at once.
-- **Snapshot records** — browse saved tab/group snapshots; open, delete, and rename them in place.
-- **Smart capture de-duplication** — standalone tabs are de-duplicated by URL, groups by name; re-capturing an existing item refreshes it as the newest entry, and a tab captured inside a group is merged into that group's snapshot (never losing sibling tabs).
+- **Snapshot records** — browse saved tab/group snapshots with the **newest capture first**; open, delete, and rename them in place.
+- **Smart capture de-duplication** — standalone tabs are de-duplicated by URL, groups by name. Re-capturing a group **only adds**: tabs captured this time come first (in Chrome's current order), while existing tabs missing from this capture are kept in their relative order at the bottom — never dropped. A tab captured inside a group is merged into that group's snapshot (never losing sibling tabs).
 - **Open** a standalone tab, a whole group, or a single tab from within a group — reusing an existing same-name group in the current window when present.
 - **Expand / collapse** tab groups in sync with Chrome (per-row and "expand/collapse all"), while snapshot records keep their own local state independent of Chrome.
 - **Favicons** rendered via Chrome's internal `/_favicon/` endpoint (works for `localhost` and `chrome://` pages, offline-friendly, no CORS issues).
@@ -47,6 +47,7 @@ src/
   popup.js            App entry: render pipeline, tab switching, fold controls
   capture.js          Reads current window tabs/groups from Chrome APIs
   operations.js       Capture / open / rename / delete / collapse logic
+  merge.js            Pure ordering + group-children merge rules (no DOM/chrome deps)
   storage.js          Layered chrome.storage.local access (meta/index/snap:*/icon:*)
   transfer.js         JSON export (a[download]) + import with schema validation
   render.js           List rendering, state icons, in-place rename

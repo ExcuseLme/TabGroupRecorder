@@ -87,8 +87,11 @@ export function validateExport(obj) {
         const c = s.children[j];
         if (!c || typeof c !== "object" || !c.id || c.type !== "tab")
           return fail(`${path}.children[${j}] 非法`);
-        if (typeof c.url !== "string" || !c.url)
-          return fail(`${path}.children[${j}].url 缺失`);
+        // D9:v0.5.0 及更早的「组内单标签捕获」会落库 url 缺失的子项,
+        // 为让这类历史导出文件仍可导入,组内 child 的 url 放宽为「缺失 / string」。
+        // 导出格式与顶层 TabSnapshot 的 url 校验不变;此类子项打开时由既有 openOne 给出失败提示。
+        if (c.url != null && typeof c.url !== "string")
+          return fail(`${path}.children[${j}].url 非法`);
         if (c.iconKey && !obj.icons[c.iconKey])
           return fail(`${path}.children[${j}].iconKey=${c.iconKey} 在 icons 中缺失`);
       }

@@ -7,6 +7,7 @@ import {
 } from "./storage.js";
 import { currentWindowId } from "./capture.js";
 import { urlCandidates, isBookmarklet, valueToSave } from "./url.js";
+import { mergeGroupChildren } from "./merge.js";
 
 const newId = () =>
   (crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -42,14 +43,20 @@ async function captureTabInGroup(row, index) {
   const dupIdx = index.findIndex((e) => e.type === "group" && e.name === name);
 
   const now = Date.now();
-  const cKey = row.url ? (await sha1(row.url)).slice(0, 16) : null;
+  // P-42/D9:优先用真实 url;兼容只有 pageUrl 的只读行模型;两者都没有时存空串(不伪造 URL)。
+  // 历史数据里可能存在 url 缺失的组内子项(v0.5.0 及更早的「组内单标签捕获」缺陷),
+  // 空 url 不参与查重 —— 否则多个无 url 项会互相命中/覆盖,违反「只增不减」。
+  const childUrl =
+    (typeof row.url === "string" && row.url) ||
+    (typeof row.pageUrl === "string" && row.pageUrl) || "";
+  const cKey = childUrl ? (await sha1(childUrl)).slice(0, 16) : null;
   const childSnap = {
     id: newId(), type: "tab",
     name: row.name?.trim() || "标签",
-    url: row.url,
+    url: childUrl,
     iconKey: cKey, createdAt: now, updatedAt: now,
   };
-  if (cKey) await ensureIcon(cKey, row.url);
+  if (cKey) await ensureIcon(cKey, childUrl);
 
   // 组不存在 → 新建(复用创建分支)
   if (dupIdx === -1) {
@@ -62,7 +69,8 @@ async function captureTabInGroup(row, index) {
   if (!existing) return { ok: false, error: "目标分组快照缺失" };
 
   const children = existing.children || [];
-  const sameIdx = children.findIndex((c) => c.url === childSnap.url);
+  // 有 url 才查重;空 url 无身份,直接追加,避免与历史无 url 子项互相覆盖(D9)
+  const sameIdx = childUrl ? children.findIndex((c) => c.url === childUrl) : -1;
   let nextChildren;
   if (sameIdx !== -1) {
     // 同 url 已在组内:就地刷新(name/icon/updatedAt),不增不删
@@ -73,8 +81,9 @@ async function captureTabInGroup(row, index) {
   }
 
   const snap = { ...existing, name, color: g.color, children: nextChildren, updatedAt: now };
-  const nextIndex = index.slice();
-  nextIndex[dupIdx] = { ...entry, name, color: g.color, childCount: nextChildren.length, updatedAt: now };
+  // §1.3:重复捕获把条目 touch 到 index 末尾(展示层反转 → 最新在上);重命名/改 URL 不移动
+  const rest = index.filter((e) => e.id !== entry.id);
+  const nextIndex = [...rest, { ...entry, name, color: g.color, childCount: nextChildren.length, updatedAt: now }];
   await writeBatch({ [`snap:${entry.id}`]: snap, index: nextIndex, meta: buildMeta(nextIndex) });
   return { ok: true, merged: true, id: entry.id, appended: sameIdx === -1 };
 }
@@ -164,30 +173,21 @@ async function captureGroupWithChildren(row, index, childSnaps, dupIdx) {
     return { ok: true, merged: false, id };
   }
 
-  // §5.3 同名合并
+  // §5.3 同名合并(design-v0.6 §2:只增不减 + 本次捕获顺序 + 旧独有项沉底)
   const entry = index[dupIdx];
   const { [`snap:${entry.id}`]: existing } = await getSnaps([entry.id]);
   if (!existing) return { ok: false, error: "合并目标快照缺失" };
 
-  const merged = mergeChildren(existing.children || [], childSnaps);
+  const merged = mergeGroupChildren(existing.children || [], childSnaps);
   const now = Date.now();
   const snap = {
     ...existing, name, color: row.color, children: merged, updatedAt: now,
   };
-  const next = index.slice();
-  next[dupIdx] = { ...entry, name, color: row.color, childCount: merged.length, updatedAt: now };
+  // §1.3:重复捕获把条目 touch 到 index 末尾(展示层反转 → 最新在上)
+  const rest = index.filter((e) => e.id !== entry.id);
+  const next = [...rest, { ...entry, name, color: row.color, childCount: merged.length, updatedAt: now }];
   await writeBatch({ [`snap:${entry.id}`]: snap, index: next, meta: buildMeta(next) });
   return { ok: true, merged: true, id: entry.id };
-}
-
-/** URL 并集去重 + 顺序以最新目标组为准(§5.3)。 */
-function mergeChildren(existing, target) {
-  const targetUrls = new Set(target.map((t) => t.url));
-  const kept = existing.filter((e) => targetUrls.has(e.url)); // 保留仍在目标组中的
-  const seen = new Set(kept.map((k) => k.url));
-  const added = target.filter((t) => !seen.has(t.url));        // 目标新增的
-  return [...target.filter((t) => kept.some((k) => k.url === t.url)), ...added]
-    .sort((a, b) => target.findIndex((t) => t.url === a.url) - target.findIndex((t) => t.url === b.url));
 }
 
 /** url → 短 hash(用作 iconKey,见 P-21)。 */

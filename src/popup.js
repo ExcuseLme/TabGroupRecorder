@@ -13,6 +13,7 @@ import {
 } from "./operations.js";
 import { buildExportObject, triggerDownload, importOverwrite } from "./transfer.js";
 import { VirtualList, renderSkeleton, clearSkeleton } from "./render.js";
+import { orderForDisplay } from "./merge.js";
 
 /** 「展开/折叠全部」按钮图标(纵向双箭头,与状态图标风格一致)。 */
 const SVG_UNFOLD_ALL = `<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3.5 6L8 2L12.5 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M3.5 10L8 14L12.5 10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
@@ -240,7 +241,10 @@ function flattenCurrent(rows) {
             child: true,
             groupRef: { name: r.name, color: r.color },
           };
-          rowObj.buttons[0].onClick = () => doCapture(rowObj);
+          // P-42/D9:捕获载荷必须携带真实 url。toCurrentTabRow 是只读展示模型(只有 pageUrl),
+          // 若直接传 rowObj,组内子项会以 url=undefined 落库,导致防重永远命中同一条、导出无法再导入。
+          // 注意:不能把 url 加进行模型 —— buildRow 见 url 会渲染出第二行 URL,改变「当前标签」外观。
+          rowObj.buttons[0].onClick = () => doCapture({ ...rowObj, url: c.url });
           out.push(rowObj);
         }
       }
@@ -254,7 +258,9 @@ function flattenCurrent(rows) {
 /** 快照记录扁平化占位:顶层行 + 展开分组的 _needSnap 占位(稍后批量补 children)。 */
 function flattenRecords() {
   const out = [];
-  for (const e of state.index) {
+  // §1.2:index 存储「最近捕获顺序(旧→新)」,展示层反转为「最新在上」。
+  // 所有快照记录渲染路径(普通/展开/编辑后同步刷新)都复用本函数,故只此一处取序。
+  for (const e of orderForDisplay(state.index)) {
     const expanded = !!state.ui.expanded[e.id];
     if (e.type === "group") {
       out.push({ kind: "group", id: e.id, name: e.name, color: e.color, expanded, _grp: true });
