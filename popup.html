@@ -34,6 +34,12 @@
   <!-- 列表:t0 先渲染骨架,t1 异步填充 -->
   <main class="list" id="list" tabindex="0"></main>
 
+  <!-- 面板高度调整手柄(§1.4):拖动改高、双击复原;键盘 ↑/↓ 微调 -->
+  <div class="resize-handle" id="resize-handle" role="separator" aria-orientation="horizontal"
+       tabindex="0" title="拖动调整面板高度,双击恢复自动">
+    <span class="badge" id="resize-badge" hidden></span>
+  </div>
+
   <div class="toast" id="toast" hidden></div>
 
   <script type="module" src="src/popup.js"></script>

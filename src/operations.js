@@ -6,6 +6,7 @@ import {
   ensureIcon, buildMeta,
 } from "./storage.js";
 import { currentWindowId } from "./capture.js";
+import { urlCandidates, isBookmarklet, valueToSave } from "./url.js";
 
 const newId = () =>
   (crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -196,23 +197,82 @@ async function sha1(text) {
 }
 
 /* ================= §6 打开 ================= */
+// §2.8:保存宽松 → 打开时统一翻译;不可导航内容不抛错,给明确失败信息。
+// P-38:不做协议白名单,候选逐个试,由 Chrome 判定能否打开。
+// §3:foreground=false 时后台打开(不转移焦点,popup 不关闭)。
+
+/**
+ * 依次尝试候选 URL 打开;任一成功即返回。
+ * **不做协议准入判断** —— data:/javascript:/chrome: 等一律交给 Chrome 决定(P-38)。
+ * @param {string} rawUrl
+ * @param {{foreground?:boolean}} opts
+ * @returns {Promise<{ok:boolean, error?:string, copy?:string}>}
+ */
+async function openOne(rawUrl, { foreground = true } = {}) {
+  const cands = urlCandidates(rawUrl);
+  if (!cands.length) {
+    const bm = isBookmarklet(rawUrl) ? (rawUrl ?? "").trim() : null;
+    return {
+      ok: false,
+      copy: bm,
+      error: bm
+        ? "bookmarklet 无法由扩展直接执行,已尝试复制到剪贴板"
+        : "该内容不是可打开的网址",
+    };
+  }
+
+  let lastErr = null;
+  for (const target of cands) {
+    try {
+      await chrome.tabs.create({ url: target, active: foreground });
+      return { ok: true };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+
+  // 全部候选都失败:bookmarklet 给复制兜底,其余报真实错误
+  const bm = isBookmarklet(rawUrl) ? (rawUrl ?? "").trim() : null;
+  return {
+    ok: false,
+    copy: bm,
+    error: bm
+      ? "bookmarklet 无法由扩展直接执行,已尝试复制到剪贴板"
+      : "打开失败:" + (lastErr?.message || "未知错误"),
+  };
+}
 
 /** 独立标签快照:新标签页打开其 URL。 */
-export async function openTabSnapshot(snap) {
-  await chrome.tabs.create({ url: snap.url, active: true });
+export async function openTabSnapshot(snap, opts) {
+  return openOne(snap.url, opts);
 }
 
 /** 分组快照:创建同名同色组并在组内打开全部标签。 */
-export async function openGroupSnapshot(snap) {
-  await openGroupByName(snap.name, snap.color, snap.children.map((c) => c.url));
+export async function openGroupSnapshot(snap, opts) {
+  return openGroupByName(snap.name, snap.color, snap.children.map((c) => c.url), opts);
 }
 
 /** 组内标签快照:在同名组(存在则复用)中打开该标签。 */
-export async function openChildSnapshot(groupSnap, child) {
-  await openGroupByName(groupSnap.name, groupSnap.color, [child.url]);
+export async function openChildSnapshot(groupSnap, child, opts) {
+  return openGroupByName(groupSnap.name, groupSnap.color, [child.url], opts);
 }
 
-async function openGroupByName(name, color, urls) {
+/**
+ * 按组名打开若干 URL(复用同窗口同名组)。
+ * @param {boolean} opts.foreground true=建完激活首个;false=全部后台,pupup 保持开启
+ */
+async function openGroupByName(name, color, urls, { foreground = true } = {}) {
+  // 逐个 URL 取候选列表(P-38:不做协议白名单)
+  const plan = [];
+  let skipped = 0;
+  for (const u of urls) {
+    const cands = urlCandidates(u);
+    if (cands.length) plan.push(cands); else skipped++;
+  }
+  if (!plan.length) {
+    return { ok: false, skipped, error: "组内没有可打开的网址" };
+  }
+
   // 找同名组(复用)
   let groupId = null;
   try {
@@ -221,26 +281,88 @@ async function openGroupByName(name, color, urls) {
     if (hit) groupId = hit.id;
   } catch { /* §13 兜底:查询失败则新建 */ }
 
+  // 关键:一律先以后台方式创建,避免 N 个标签依次抢焦点(前台时最后只激活首个)
   const tabIds = [];
-  for (const url of urls) {
-    const t = await chrome.tabs.create({ url, active: false });
-    if (t?.id != null) tabIds.push(t.id);
+  for (const cands of plan) {
+    let created = false;
+    for (const target of cands) {          // 候选逐个试,任一成功即止
+      try {
+        const t = await chrome.tabs.create({ url: target, active: false });
+        if (t?.id != null) { tabIds.push(t.id); created = true; break; }
+      } catch { /* 换下一个候选 */ }
+    }
+    if (!created) skipped++;
   }
-  if (!tabIds.length) return;
+  if (!tabIds.length) return { ok: false, skipped, error: "打开失败" };
 
-  if (groupId == null) {
-    groupId = await chrome.tabs.group({ tabIds });
-  } else {
-    await chrome.tabs.group({ tabIds, groupId });
+  try {
+    if (groupId == null) {
+      groupId = await chrome.tabs.group({ tabIds });
+    } else {
+      await chrome.tabs.group({ tabIds, groupId });
+    }
+  } catch (e) {
+    console.warn("[tabs.group] 失败:", e);
   }
 
   // §13:Chrome 145 下 title 写入可能失败 → try/catch 兜底,color 同理
-  try {
-    await chrome.tabGroups.update(groupId, { title: name, color });
-  } catch (e) {
-    console.warn("[tabGroups.update] 失败(可能是 Chrome 145 已知 bug):", e);
-    try { await chrome.tabGroups.update(groupId, { color }); } catch { /* 忽略 */ }
+  if (groupId != null) {
+    try {
+      await chrome.tabGroups.update(groupId, { title: name, color });
+    } catch (e) {
+      console.warn("[tabGroups.update] 失败(可能是 Chrome 145 已知 bug):", e);
+      try { await chrome.tabGroups.update(groupId, { color }); } catch { /* 忽略 */ }
+    }
   }
+
+  // 前台模式:只激活首个(§3.4 避免批量抢焦点)
+  if (foreground && tabIds.length) {
+    try { await chrome.tabs.update(tabIds[0], { active: true }); } catch { /* 忽略 */ }
+  }
+
+  return { ok: true, count: tabIds.length, skipped };
+}
+
+/* ================= URL 编辑(§2.5) ================= */
+// 纪律:仅 valueToSave 的非空校验,不做格式/协议校验、不做重复拦截(§2.6 / §2.7)。
+
+/** 独立标签快照改 URL:index 与 snap 双写(与 renameSnapshot 一致)。 */
+export async function updateTabUrl(id, url) {
+  const v = valueToSave(url);
+  if (!v.ok) return v;
+
+  const index = await loadIndex();
+  const i = index.findIndex((e) => e.id === id);
+  if (i === -1) return { ok: false, error: "未找到" };
+  const { [`snap:${id}`]: snap } = await getSnaps([id]);
+  if (!snap) return { ok: false, error: "未找到" };
+
+  const now = Date.now();
+  const next = index.slice();
+  next[i] = { ...index[i], url: v.value, updatedAt: now };
+  await writeBatch({
+    [`snap:${id}`]: { ...snap, url: v.value, updatedAt: now },
+    index: next,
+    meta: buildMeta(next),
+  });
+  return { ok: true, url: v.value };
+}
+
+/** 组内标签快照改 URL:只写 snap.children,不动 index(与 renameChild 一致)。 */
+export async function updateChildUrl(groupId, childId, url) {
+  const v = valueToSave(url);
+  if (!v.ok) return v;
+
+  const { [`snap:${groupId}`]: snap } = await getSnaps([groupId]);
+  if (!snap || snap.type !== "group") return { ok: false, error: "未找到" };
+
+  const now = Date.now();
+  const children = snap.children.map((c) =>
+    c.id === childId ? { ...c, url: v.value, updatedAt: now } : c);
+  await writeBatch({
+    [`snap:${groupId}`]: { ...snap, children, updatedAt: now },
+  });
+  return { ok: true, url: v.value };
 }
 
 /* ================= §7 重命名 ================= */

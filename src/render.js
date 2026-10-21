@@ -58,7 +58,7 @@ export class VirtualList {
 
 function buildRow(row) {
   const div = document.createElement("div");
-  div.className = "row" + (row.child ? " child" : "");
+  div.className = "row" + (row.child ? " child" : "") + (row.url ? " has-url" : "");
 
   const dot = document.createElement("div");
   dot.className = "dot";
@@ -79,6 +79,10 @@ function buildRow(row) {
   const main = document.createElement("div");
   main.className = "row-main";
 
+  // 名称行(状态图标 + 名称)
+  const head = document.createElement("div");
+  head.className = "row-head";
+
   // 分组行:状态图标 <> / ><
   if (row.kind === "group") {
     const ic = document.createElement("span");
@@ -86,17 +90,37 @@ function buildRow(row) {
     ic.title = row.expanded ? "点击后收起" : "点击后展开";
     ic.innerHTML = row.expanded ? SVG_FOLD : SVG_UNFOLD;
     ic.addEventListener("click", (e) => { e.stopPropagation(); row.onToggle?.(); });
-    main.appendChild(ic);
+    head.appendChild(ic);
   }
 
   const title = document.createElement("span");
   title.className = "row-title";
   title.textContent = row.name;
+  // 悬停显示完整标题(与原 URL 行一致,走原生 title —— P-31:不自绘 tooltip)。
+  // 长标题被 text-overflow:ellipsis 截断时,用户仍能看到全文(§2.12)。
+  if (row.name) title.title = row.name;
   // 仅非只读行可点击进入编辑(其他问题1:当前标签 tab 为只读)
   if (!row.readonly) {
-    title.addEventListener("click", () => startRename(title, row));
+    title.addEventListener("click", () => startEdit(title, row, "name"));
   }
-  main.appendChild(title);
+  head.appendChild(title);
+  main.appendChild(head);
+
+  // URL 第二行(§2.3):仅快照记录里的标签行有 url;分组行没有,保持单行
+  if (row.url !== undefined && row.url !== null) {
+    const field = document.createElement("div");
+    field.className = "url-field";
+    const input = document.createElement("span");
+    input.className = "url-input";
+    input.textContent = row.url;
+    input.title = row.url;                     // 完整值走原生 title(P-31:不自绘 tooltip)
+    if (!row.readonly) {
+      input.addEventListener("click", () => startEdit(input, row, "url"));
+    }
+    field.appendChild(input);
+    // 重复提示徽标位(编辑时由 onUrlInput 控制显示)
+    main.appendChild(field);
+  }
 
   div.appendChild(main);
 
@@ -107,20 +131,36 @@ function buildRow(row) {
     const btn = document.createElement("button");
     btn.className = `btn ${b.cls}`;
     btn.textContent = b.label;
-    btn.addEventListener("click", (e) => { e.stopPropagation(); b.onClick(); });
+    if (b.title) btn.title = b.title;
+    // 透传事件对象:供 Ctrl 后台打开读取修饰键(§3.2)
+    btn.addEventListener("click", (e) => { e.stopPropagation(); b.onClick(e); });
     tools.appendChild(btn);
   }
   div.appendChild(tools);
   return div;
 }
 
-/** 名称编辑(§7):点击文本进入编辑态,失焦/回车提交。 */
-function startRename(el, row) {
+/**
+ * 就地编辑(§7 名称 / §2.4 URL):点击文本进入编辑态,失焦/回车提交,Esc 放弃。
+ * @param {HTMLElement} el 被编辑的可编辑元素
+ * @param {any} row 行模型
+ * @param {'name'|'url'} field 编辑哪个字段
+ */
+function startEdit(el, row, field = "name") {
   if (el.isContentEditable) return;
   const list = LIST();
+  const isUrl = field === "url";
+  const fieldEl = isUrl ? el.closest(".url-field") : null;
+
   el.contentEditable = "true";
   el.classList.add("editing");
+  if (fieldEl) fieldEl.classList.add("editing");
   el.style.textOverflow = "clip";  // 编辑态去掉省略号(避免遮挡文本)
+
+  // 编辑态临时摘掉原生 tooltip:否则悬停/聚焦时气泡浮在文本上方挡住正在编辑的内容,
+  // 退出编辑时原样还原(§2.12)。保存原值以保证 restore 精确。
+  const savedTitle = el.getAttribute("title");
+  if (savedTitle != null) el.removeAttribute("title");
 
   // 限制编辑框宽度:不超过列表可视宽度(避免遮挡右侧按钮,问题3/其他问题3)
   const rowEl = el.closest(".row");
@@ -135,6 +175,14 @@ function startRename(el, row) {
   sel.removeAllRanges();
   sel.addRange(range);
 
+  // 编辑中实时重复检测(§2.7):仅提示,不拦截保存
+  const onInput = () => {
+    if (!fieldEl) return;
+    const v = el.textContent.trim();
+    fieldEl.classList.toggle("is-dup", !!v && !!row.isDupContent?.(v));
+  };
+  if (isUrl) el.addEventListener("input", onInput);
+
   // 统一收尾:finish(save=true) 提交,finish(false) 放弃(Escape)。
   // 回滚 0.1.10/0.1.11 的 async/scheduleCommit 复杂化(曾致按钮丢失/顺序错乱)。
   // 完成编辑后**同步** flush 写盘 + 整 tab 刷新(P-18/P-22):同步执行,用户永远
@@ -146,9 +194,34 @@ function startRename(el, row) {
     pendingEdit = null;                    // 已收尾,取消 pagehide 兜底
     el.contentEditable = "false";
     el.classList.remove("editing");
+    if (fieldEl) fieldEl.classList.remove("editing", "is-dup");
+    el.style.textOverflow = "";
+    el.style.maxWidth = "";
+    el.style.minWidth = "";
+    // 还原编辑前摘掉的原生 tooltip(§2.12)
+    if (savedTitle != null) el.setAttribute("title", savedTitle);
+    if (isUrl) el.removeEventListener("input", onInput);
     list.scrollLeft = 0;
 
     const val = el.textContent.trim();
+
+    // ---------- URL 字段(§2.4 / §2.6) ----------
+    if (isUrl) {
+      const oldUrl = row.url ?? "";
+      if (!save) { el.textContent = oldUrl; return; }   // Escape 还原
+      if (!val) {                                        // 唯一校验:非空
+        el.textContent = oldUrl;
+        row.onUrlRejected?.("内容不能为空");
+        return;
+      }
+      if (val === oldUrl) { el.textContent = val; return; }
+      row.url = val;
+      const r = row.onUrlEdit?.(val);                    // 写盘 + 缓存 + 同步刷列表
+      if (r && r.ok === false) row.onUrlRejected?.(r.error || "保存失败");
+      return;
+    }
+
+    // ---------- 名称字段(与原有 startRename 行为一致) ----------
     if (save && val && val !== row.name) {
       row.name = val;
       row.onFlush?.(val);                  // 同步 flush 写盘(顶层直写 / 组内记 pending)
@@ -160,7 +233,10 @@ function startRename(el, row) {
   };
 
   // 注册 pagehide 兜底:仅当仍在编辑(done=false)时同步落盘(P-19)
-  pendingEdit = { el, row, flushNow: (v) => { if (!done && v && v !== row.name) row.onFlush?.(v); } };
+  // URL 不做兜底:属新增字段,且空值/无效输入不应静默写盘
+  if (!isUrl) {
+    pendingEdit = { el, row, flushNow: (v) => { if (!done && v && v !== row.name) row.onFlush?.(v); } };
+  }
 
   el.addEventListener("blur", () => finish(true), { once: true });
   el.addEventListener("keydown", (e) => {

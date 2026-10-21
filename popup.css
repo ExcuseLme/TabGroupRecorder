@@ -32,18 +32,52 @@ body {
   overflow-x: hidden;
 }
 
+/* ===== 面板高度调整(§1.3 / §1.4)=====
+   只在「用户拖过」(html 有 data-panel-h)时接管高度;
+   没有该属性时所有规则不生效 → 原样走内容自适应,即便拖拽逻辑异常也不会塌缩。
+   ⚠️ 高度硬上限 = 600px(Chromium kExtensionPopupMaxSize = {800,600} 源码硬编码),
+      超过它 html 会高于视口 → 出现外层滚动条(P-32 复发),详见 docs §1.10 */
+html[data-panel-h] { height: var(--h); }
+html[data-panel-h] body { height: 100%; }
+html[data-panel-h] .list { max-height: none; flex: 1 1 auto; min-height: 0; }
+
+/* 手柄压到 6px:可点区域仍够用,省下的 4px 全部让给列表 */
+.resize-handle {
+  flex: 0 0 auto; height: 6px;
+  display: grid; place-items: center;
+  background: var(--bg); cursor: ns-resize;
+  position: relative;
+}
+.resize-handle::before {
+  content: ""; width: 36px; height: 3px; border-radius: 2px; background: #d5d8dd;
+}
+.resize-handle:hover::before { background: #9ca3af; }   /* 无过渡(遵循 transition:none 约定) */
+.resize-handle:focus-visible { outline: 1px solid var(--blue); outline-offset: -1px; }
+.resize-handle.dragging { background: #f1f2f4; }
+.resize-handle.dragging::before { background: var(--blue); width: 44px; }
+.resize-handle .badge {
+  position: absolute; right: 10px; top: -18px;
+  font-size: 10px; color: #fff; background: #1f2328;
+  padding: 2px 6px; border-radius: 4px; pointer-events: none; white-space: nowrap;
+}
+/* 拖动中:全局 ns-resize 光标 + 禁止选中 */
+html.resizing, html.resizing * { cursor: ns-resize !important; user-select: none !important; }
+
 /* ===== Tab 栏 ===== */
-.tabbar { display: flex; gap: 4px; padding: 8px 12px; background: var(--bg); }
+/* 竖向 padding 8→4(收紧);水平保留 12 作为全局左右对齐基准:
+   它是 tab 按钮与下方行内容的共同左边线,归零会让 tab 与行错位 */
+.tabbar { display: flex; gap: 4px; padding: 3px 12px; background: var(--bg); }
 .tab {
-  flex: 1; height: 32px; border: none; border-radius: 6px;
+  flex: 1; height: 28px; border: none; border-radius: 6px;
   background: #eceef1; color: var(--text-2); font-size: 13px; cursor: pointer;
 }
 .tab.active { background: var(--blue); color: #fff; }
 
 /* ===== 页头 ===== */
+/* 竖向 padding 12→5;水平保留 12 与 tabbar/list 同基准 */
 .header {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 12px 16px; background: var(--row); border-bottom: 1px solid var(--line);
+  padding: 5px 12px; background: var(--row); border-bottom: 1px solid var(--line);
 }
 .title-group { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .title { font-size: 16px; font-weight: 600; white-space: nowrap; }
@@ -72,12 +106,19 @@ body {
 .list {
   flex: 1 1 auto;
   min-height: 0;
-  /* 总内容 = tabbar+header+padding+此值 必须 ≤ popup 视口(实测 600)才不溢出(P-32 日志:560→总659>600 溢出)。
-     480 + 固定区约100 = 约580 < 600 → html 不溢出、外层无滚动条;列表内容多仍内部滚动 */
-  max-height: 480px;
+  /* 高度账(固定区已压到 78px):
+       tabbar 34(3+28+3) + header 37(5+26+5+1) + handle 6 = 77
+       77 + 523 = 600 → 正好用满 Chrome popup 的硬上限 kExtensionPopupMaxSize.h=600
+     列表拿到 523px(87% 的可用高度)。
+     未拖过时默认走 max-height:523,总高 600 不溢出 → 无外层滚动条(P-32 不会复发) */
+  max-height: 523px;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 8px 12px 12px;
+  /* 上下 padding 大幅收紧(消除竖向浪费);左右保留 12 作为对齐基准:
+     它是 tab 按钮 / header 标题 / 行内容三者的共同左边线,归零会让行内容顶到面板边缘、
+     与上方 tab 和标题错位。滚动条本身占位(实测 10px)不遮盖内容,故右侧无需额外让位。
+     底部留 4px:避免最后一行紧贴抓手(行自带 2px margin,合计 6px 呼吸空间)。 */
+  padding: 0 12px 4px;
   background: var(--bg);
 }
 .list:focus { outline: none; }
@@ -106,7 +147,14 @@ body {
 .dot--img { background: #fff; }
 .row.child .dot { width: 16px; height: 16px; }
 .dot--img img { width: 100%; height: 100%; object-fit: contain; display: block; }
-.row-main { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; }
+/* 行主区:名称/URL 双行时为纵向排列(§2.3) */
+.row-main { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: stretch; gap: 1px; }
+/* 名称行(状态图标 + 名称)横向 */
+.row-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
+/* 带 URL 的行需要容纳两行内容 → 略增高度(§2.3) */
+.row.has-url { min-height: 52px; padding-top: 6px; padding-bottom: 6px; }
+.row.has-url .row-head { align-items: center; }
+
 .row-title {
   font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   cursor: text;
@@ -119,6 +167,48 @@ body {
   scrollbar-width: none;
 }
 .row-title[contenteditable="true"]::-webkit-scrollbar { display: none; }
+
+/* ===== URL 第二行(§2.3 / §2.7)=====
+   框(.url-field)与文本(.url-input)分离:边框挂在框上,不随文本内部滚动而抖动 */
+.url-field {
+  display: flex; align-items: center; min-width: 0;
+  padding: 1px 4px; border-radius: 4px; position: relative;
+  border: 1px solid transparent;   /* 常态:透明边框占位,换色时无布局位移 */
+  background: transparent;
+}
+.url-input {
+  min-width: 0; flex: 1 1 auto;
+  font-size: 11px; line-height: 15px; color: var(--text-2);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  outline: none;
+}
+.url-field:hover { background: #eef0f3; }
+.url-field:hover .url-input { color: #374151; }
+
+/* 编辑态:蓝框 + 文本在框内横向滚动、不显示省略号 */
+.url-field.editing { border-color: var(--blue); background: #fff; }
+.url-field.editing .url-input {
+  color: var(--text); cursor: text;
+  overflow-x: auto; overflow-y: hidden; text-overflow: clip;
+  scrollbar-width: none;
+}
+.url-field.editing .url-input::-webkit-scrollbar { display: none; }
+
+/* 重复警示(§2.7 方案3):黄框挂在输入框上 + 右上角始终显示的气泡(伪元素,不属于文本) */
+.url-field.is-dup { border-color: #f59e0b; background: #fffbeb; }
+.url-field.is-dup::after {
+  content: "与已保存内容重复";
+  position: absolute; right: -1px; top: -17px;
+  font-size: 10px; line-height: 16px; padding: 0 6px;
+  background: #b45309; color: #fff; border-radius: 3px;
+  white-space: nowrap; pointer-events: none; z-index: 5;
+}
+.url-field.is-dup::before {
+  content: ""; position: absolute; right: 7px; top: 4px;
+  border: 4px solid transparent; border-top-color: #b45309;
+  pointer-events: none; z-index: 6;
+}
+
 .row-tools { display: flex; gap: 6px; flex-shrink: 0; }
 
 /* 状态图标 <> / >< */

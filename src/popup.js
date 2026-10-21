@@ -9,6 +9,7 @@ import {
   capture, openTabSnapshot, openGroupSnapshot, openChildSnapshot,
   renameSnapshot, deleteSnapshot, deleteChild,
   toggleAllBrowserGroups,
+  updateTabUrl, updateChildUrl,
 } from "./operations.js";
 import { buildExportObject, triggerDownload, importOverwrite } from "./transfer.js";
 import { VirtualList, renderSkeleton, clearSkeleton } from "./render.js";
@@ -32,11 +33,124 @@ function boot() {
   renderSkeleton();                    // 立即画骨架
   bindTabs();
   bindHeaderActions();
+  bindResizeHandle();                  // 面板高度拖拽(§1.4;纯同步,不阻塞 t0)
   bindChromeRefresh();                 // 监听 Chrome 标签/分组变化 → 面板自动同步(P-29 治本,照参照 delayRefresh)
   // 面板此刻已可见;t1 紧随其后异步开始(不阻塞 t0)
   requestAnimationFrame(() => { void paint(); });
   // P-32 诊断:渲染后打印各层高度(scrollHeight vs clientHeight),定位外层滚动条归属
   setTimeout(diagnoseScroll, 500);
+}
+
+/* ============ 面板高度调整(§1.5) ============ */
+// H_MAX 必须 = Chrome popup 硬上限(Chromium kExtensionPopupMaxSize = {800,600})。
+// 超过它 html 会高于视口 → 外层滚动条(P-32 复发),见 docs §1.10。
+const H_MIN = 260, H_MAX = 600, H_STEP = 8, H_STEP_BIG = 32;
+let dragState = null;
+let badgeTimer = null;
+
+/** 徽标显隐的唯一入口(text=null 隐藏)。统一 clearTimeout,避免残留定时器误隐藏。 */
+function setBadge(text) {
+  const badge = document.getElementById("resize-badge");
+  if (!badge) return;
+  clearTimeout(badgeTimer);
+  badgeTimer = null;
+  if (text == null) { badge.hidden = true; return; }
+  badge.textContent = text;
+  badge.hidden = false;
+}
+
+/** 短暂显示徽标后自动隐藏(键盘微调用,不常驻)。 */
+function flashBadge(text) {
+  setBadge(text);
+  badgeTimer = setTimeout(() => setBadge(null), 900);
+}
+
+/**
+ * 应用高度:只改根节点 --h 变量与 data-panel-h 开关(单次布局)。
+ * @param {number} h 目标高度
+ * @param {{showBadge?:boolean}} opts 是否显示高度徽标
+ *   —— **默认 false**:恢复持久化高度时不能显示徽标,否则每次开面板都挂着 "600 px"
+ *   (P-39)。仅「主动调整」(拖拽 / 键盘)才传 true。
+ */
+function applyH(h, { showBadge = false } = {}) {
+  const v = Math.max(H_MIN, Math.min(H_MAX, Math.round(h)));
+  const root = document.documentElement;
+  root.style.setProperty("--h", v + "px");
+  root.dataset.panelH = "1";            // 打开"显式高度"开关(§1.3)
+  if (showBadge) setBadge(v + " px");
+  return v;
+}
+
+/** 当前实际渲染高度(未拖过时作为拖拽起点,从"自适应"平滑进入拖拽)。 */
+function currentPanelH() {
+  return Math.round(document.body.getBoundingClientRect().height);
+}
+
+/** 持久化高度(只在松手/键盘调整后写一次,拖动中不写)。 */
+function persistPanelH(h) {
+  const v = Math.round(h);
+  state.ui.panelHeight = v;
+  try { chrome.storage.local.set({ ui: state.ui }); } catch { /* 忽略 */ }
+}
+
+/** 清除持久化高度 → 恢复内容自适应(双击手柄)。 */
+function resetPanelH() {
+  const root = document.documentElement;
+  root.style.removeProperty("--h");
+  delete root.dataset.panelH;
+  setBadge(null);
+  delete state.ui.panelHeight;
+  try { chrome.storage.local.set({ ui: state.ui }); } catch { /* 忽略 */ }
+}
+
+function bindResizeHandle() {
+  const handle = document.getElementById("resize-handle");
+  if (!handle) return;
+
+  handle.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    dragState = { startY: e.clientY, startH: currentPanelH(), id: e.pointerId };
+    handle.setPointerCapture(e.pointerId);       // 关键:指针移出面板仍能收到 move
+    handle.classList.add("dragging");
+    document.documentElement.classList.add("resizing");
+  });
+
+  handle.addEventListener("pointermove", (e) => {
+    if (!dragState || e.pointerId !== dragState.id) return;
+    // 向下 = 变高;拖拽过程中实时显示徽标(这是"主动调整",应当显示)
+    applyH(dragState.startH + (e.clientY - dragState.startY), { showBadge: true });
+  });
+
+  const endDrag = (e) => {
+    if (!dragState || (e && e.pointerId !== dragState.id)) return;
+    dragState = null;
+    handle.classList.remove("dragging");
+    document.documentElement.classList.remove("resizing");
+    setBadge(null);                      // 松手即隐藏徽标,不常驻
+    // 读回真实高度落盘,保证存储值与视觉一致
+    if (document.documentElement.dataset.panelH) persistPanelH(currentPanelH());
+  };
+  handle.addEventListener("pointerup", endDrag);
+  handle.addEventListener("pointercancel", endDrag);
+
+  // 双击:恢复自适应
+  handle.addEventListener("dblclick", (e) => { e.preventDefault(); resetPanelH(); });
+
+  // 键盘无障碍调整:徽标短暂闪现后自动消失(不常驻,见 P-39)
+  handle.addEventListener("keydown", (e) => {
+    const cur = currentPanelH();
+    let next = null;
+    if (e.key === "ArrowUp") next = cur - (e.shiftKey ? H_STEP_BIG : H_STEP);
+    else if (e.key === "ArrowDown") next = cur + (e.shiftKey ? H_STEP_BIG : H_STEP);
+    else if (e.key === "Home") next = H_MIN;
+    else if (e.key === "End") next = H_MAX;
+    if (next == null) return;
+    e.preventDefault();
+    const v = applyH(next);          // 不在此显示徽标
+    flashBadge(v + " px");           // 短暂闪现,900ms 后自动隐藏
+    persistPanelH(v);
+  });
 }
 
 /** P-32 诊断:哪层 scrollHeight > clientHeight,滚动条就属于谁。 */
@@ -79,6 +193,8 @@ async function paint() {
     state.index = index;
     state.ui = ui || { expanded: {} };
     state.tab = "current";   // 每次展开面板始终进入「当前标签」(问题1)
+    // §1.6:应用上次拖拽保存的高度(必须在 t1 之后 —— t0 零 await 不能读 storage)
+    if (state.ui.panelHeight) applyH(state.ui.panelHeight);
     syncTabs();
 
     if (state.tab === "current") await renderCurrent();
@@ -144,7 +260,8 @@ function flattenRecords() {
       out.push({ kind: "group", id: e.id, name: e.name, color: e.color, expanded, _grp: true });
       if (expanded) out.push({ _needSnap: e.id });
     } else {
-      out.push({ kind: "tab", id: e.id, name: e.name, iconKey: e.iconKey });
+      // §2.3:顶层标签快照带 url → 渲染第二行(来自 index,零额外读取)
+      out.push({ kind: "tab", id: e.id, name: e.name, iconKey: e.iconKey, url: e.url });
     }
   }
   return out;
@@ -273,6 +390,28 @@ function toCurrentTabRow(r) {
   };
 }
 
+/**
+ * §2.7 实时重复检测:判断内容是否与「其它」快照重复。
+ * 数据源全部来自内存(state.index + state.recordsRows),零额外 IO。
+ * 已知局限:折叠未展开分组的 children 不在检测范围内(漏报可接受,提示非门禁)。
+ * @param {string} content 待检测内容
+ * @param {string} selfId 自身 id(排除自己)
+ * @returns {boolean}
+ */
+function isDupContent(content, selfId) {
+  const v = (content ?? "").trim();
+  if (!v) return false;
+  for (const e of state.index) {                       // 顶层标签快照(必然可用)
+    if (e.id === selfId) continue;
+    if (e.type === "tab" && (e.url ?? "").trim() === v) return true;
+  }
+  for (const r of state.recordsRows) {                 // 已渲染行(含已展开分组的 children)
+    if (!r || r.id === selfId) continue;
+    if (r.kind === "tab" && (r.url ?? "").trim() === v) return true;
+  }
+  return false;
+}
+
 /** 快照记录·顶层行绑定行为。 */
 function bindRecordRow(r) {
   if (r.kind === "group") {
@@ -284,7 +423,8 @@ function bindRecordRow(r) {
       onRefresh: () => refreshRecordsSync(),          // 同步整 tab 刷新(P-18/22)
       onFlush: (v) => flushTopLevel(r.id, v),   // pagehide 同步直写(P-19)
       buttons: [
-        { cls: "open", label: "打开", onClick: () => doOpenGroup(r.id) },
+        // §3.3:title 让用户发现 Ctrl 手势
+        { cls: "open", label: "打开", title: "打开(按住 Ctrl 后台打开)", onClick: (e) => doOpenGroup(r.id, e) },
         { cls: "del", label: "删除", onClick: () => doDelete(r.id) },
       ],
     };
@@ -295,8 +435,12 @@ function bindRecordRow(r) {
     onRenamed: (v) => renameIndexEntry(r.id, v),       // 同步更新内存 index(P-18/22)
     onRefresh: () => refreshRecordsSync(),              // 同步整 tab 刷新(P-18/22)
     onFlush: (v) => flushTopLevel(r.id, v),     // pagehide 同步直写(P-19)
+    // §2.4 / §2.7:URL 查看 + 就地编辑 + 实时重复提示
+    isDupContent: (v) => isDupContent(v, r.id),
+    onUrlEdit: (v) => doEditUrlTop(r.id, v),
+    onUrlRejected: (msg) => toast(msg),
     buttons: [
-      { cls: "open", label: "打开", onClick: () => doOpenTab(r.id) },
+      { cls: "open", label: "打开", title: "打开(按住 Ctrl 后台打开)", onClick: (e) => doOpenTab(r.id, e) },
       { cls: "del", label: "删除", onClick: () => doDelete(r.id) },
     ],
   };
@@ -317,7 +461,7 @@ function renameIndexEntry(id, name) {
 /** 快照记录·组内子标签行。 */
 function toRecordChildRow(c, parentId) {
   return {
-    kind: "tab", id: c.id, name: c.name, iconKey: c.iconKey,
+    kind: "tab", id: c.id, name: c.name, iconKey: c.iconKey, url: c.url,
     child: true, parentId,
     onRename: (v) => renameChild(parentId, c.id, v),
     onRenamed: (v) => {                                   // 同步缓存(P-17)
@@ -326,8 +470,12 @@ function toRecordChildRow(c, parentId) {
     },
     onRefresh: () => refreshRecordsSync(),                // 同步整 tab 刷新(P-18/22)
     onFlush: (v) => flushChild(parentId, c.id, v),        // pagehide 补偿(P-19)
+    // §2.4 / §2.7:URL 查看 + 就地编辑 + 实时重复提示
+    isDupContent: (v) => isDupContent(v, c.id),
+    onUrlEdit: (v) => doEditUrlChild(parentId, c.id, v),
+    onUrlRejected: (msg) => toast(msg),
     buttons: [
-      { cls: "open", label: "打开", onClick: () => doOpenChild({ id: c.id, parentId }) },
+      { cls: "open", label: "打开", title: "打开(按住 Ctrl 后台打开)", onClick: (e) => doOpenChild({ id: c.id, parentId }, e) },
       { cls: "del", label: "删除", onClick: () => doDeleteChild({ id: c.id, parentId }) },
     ],
   };
@@ -345,19 +493,90 @@ async function doCapture(row) {
   }
 }
 
-async function doOpenTab(id) {
-  const s = await findSnap(id);
-  if (s) await openTabSnapshot(s);
+/**
+ * §3.2 取修饰键:Ctrl(Win/Linux)或 Cmd(macOS)→ 后台打开。
+ * @returns {boolean} true = 后台打开(不转移焦点,面板保持开启)
+ */
+function isBackgroundOpen(e) {
+  return !!(e?.ctrlKey || e?.metaKey);
 }
-async function doOpenGroup(id) {
-  const s = await findSnap(id);
-  if (s) await openGroupSnapshot(s);
+
+/** §3.3 首次使用提示(仅一次):让用户发现 Ctrl 手势。 */
+function maybeTipCtrl() {
+  if (state.ui.ctrlTipShown) return;
+  state.ui.ctrlTipShown = true;
+  toast("提示:按住 Ctrl 点击「打开」可在后台打开并保持面板");
+  try { chrome.storage.local.set({ ui: state.ui }); } catch { /* 忽略 */ }
 }
-async function doOpenChild(row) {
+
+/** 统一处理打开结果反馈(§3.3 / §2.8)。 */
+function handleOpenResult(r, foreground) {
+  if (!r) return;
+  if (r.ok) {
+    if (!foreground) toast("已后台打开(面板保持开启)");
+    return;
+  }
+  if (r.copy) {
+    // bookmarklet:尝试复制,给明确退出路径(§2.8)
+    navigator.clipboard?.writeText(r.copy)
+      .then(() => toast("bookmarklet 无法由扩展执行,已复制,可粘贴到地址栏运行"))
+      .catch(() => toast(r.error || "打开失败"));
+    return;
+  }
+  toast(r.error || "打开失败");
+}
+
+async function doOpenTab(id, e) {
+  const s = await findSnap(id);
+  if (!s) return;
+  const bg = isBackgroundOpen(e);
+  maybeTipCtrl();
+  handleOpenResult(await openTabSnapshot(s, { foreground: !bg }), !bg);
+}
+async function doOpenGroup(id, e) {
+  const s = await findSnap(id);
+  if (!s) return;
+  const bg = isBackgroundOpen(e);
+  maybeTipCtrl();
+  handleOpenResult(await openGroupSnapshot(s, { foreground: !bg }), !bg);
+}
+async function doOpenChild(row, e) {
   const g = await findSnap(row.parentId);
   const c = g?.children?.find((x) => x.id === row.id);
-  if (g && c) await openChildSnapshot(g, c);
+  if (!g || !c) return;
+  const bg = isBackgroundOpen(e);
+  maybeTipCtrl();
+  handleOpenResult(await openChildSnapshot(g, c, { foreground: !bg }), !bg);
 }
+
+/* ============ §2.4 URL 编辑 ============ */
+/** 顶层标签快照改 URL:写盘 + 同步缓存 + 同步重建列表(P-18/P-22 纪律)。 */
+async function doEditUrlTop(id, url) {
+  const r = await updateTabUrl(id, url);
+  if (!r.ok) return r;
+  // 同步更新内存 index,避免切 tab 后回退(P-17 同类)
+  const i = state.index.findIndex((e) => e.id === id);
+  if (i !== -1) {
+    const next = state.index.slice();
+    next[i] = { ...next[i], url: r.url, updatedAt: Date.now() };
+    state.index = next;
+  }
+  const cached = state.recordsRows.find((t) => t.id === id);
+  if (cached) cached.url = r.url;
+  refreshRecordsSync();
+  return { ok: true };
+}
+
+/** 组内标签快照改 URL:只改该 child。 */
+async function doEditUrlChild(groupId, childId, url) {
+  const r = await updateChildUrl(groupId, childId, url);
+  if (!r.ok) return r;
+  const cached = state.recordsRows.find((t) => t.id === childId);
+  if (cached) cached.url = r.url;
+  refreshRecordsSync();
+  return { ok: true };
+}
+
 async function doDelete(id) {
   const r = await deleteSnapshot(id);
   if (r.ok) { toast("已删除"); await reloadIndex(); await renderRecords(); }
