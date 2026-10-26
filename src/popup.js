@@ -27,13 +27,32 @@ const state = {
   currentRows: [],       // 当前标签行(readWindow 结果)
   recordsRows: [],       // 快照记录扁平行
   recordsLoaded: false,
+  renderGen: 0,          // 渲染代际 token:await 之后校验,防止旧渲染覆盖新 tab(P-45)
+  // 快照记录正则搜索态(design-v0.6 §4);纯读派生视图,不落盘
+  search: {
+    active: false,
+    gen: 0,              // 每次进入/退出 +1,用于丢弃过期的组快照加载结果
+    query: "",
+    re: null,            // null = 空查询(不过滤)
+    invalid: false,      // 正则语法错误
+    composing: false,    // 中文输入法组合期不编译
+    snaps: null,         // { "snap:{groupId}": GroupSnapshot } 全量组快照缓存
+    snapsLoading: null,  // 进行中的加载 Promise(并发去重)
+    rows: [],            // 搜索投影行(不写 state.recordsRows)
+    expanded: {},        // 搜索态临时展开覆盖(不落盘)
+    prevScroll: 0,       // 进入搜索前的滚动位置,退出时恢复
+  },
 };
+
+/** 快照图标 pageUrl 内存缓存(iconKey → pageUrl 或 "" 负缓存),避免搜索每 120ms 重渲染时重复读 storage。 */
+const iconPageCache = new Map();
 
 /* ============ t0:同步,零 await ============ */
 function boot() {
   renderSkeleton();                    // 立即画骨架
   bindTabs();
   bindHeaderActions();
+  bindSearchInteractions();            // 搜索按钮 / 覆盖层输入 / 结果行 mousedown 保护(design-v0.6 §4)
   bindResizeHandle();                  // 面板高度拖拽(§1.4;纯同步,不阻塞 t0)
   bindChromeRefresh();                 // 监听 Chrome 标签/分组变化 → 面板自动同步(P-29 治本,照参照 delayRefresh)
   // 面板此刻已可见;t1 紧随其后异步开始(不阻塞 t0)
@@ -274,26 +293,41 @@ function flattenRecords() {
 }
 
 async function renderCurrent() {
+  const gen = ++state.renderGen;
   clearSkeleton();
   setHeader("当前标签", "(当前窗口中的所有标签和分组)", false);
+  let rows = [];
   try {
-    state.currentRows = await readWindow();   // popup 直连 API(§14.1)
+    rows = await readWindow();   // popup 直连 API(§14.1)
   } catch (e) {
     console.error("readWindow 失败:", e);
-    state.currentRows = [];
   }
+  // P-45:await 期间可能已切 tab / 已发起新渲染 → 旧结果直接丢弃
+  if (gen !== state.renderGen || state.tab !== "current") return;
+  state.currentRows = rows;
   renderList();
 }
 
 async function renderRecords() {
+  const gen = ++state.renderGen;
   clearSkeleton();
   setHeader("快照记录", "(已保存的所有标签和分组快照)", true);
   await applyPendingChildEdits();          // P-19:应用 pagehide 期间的组内改名补偿
   const { index } = await getFirstPaint();  // 含补偿后的最新 index
+  if (gen !== state.renderGen || state.tab !== "records") return;
   state.index = index;
   if (!state.index.length) { showEmpty("暂无快照,去「当前标签」捕获"); return; }
 
+  // 搜索态:全量组快照缓存就绪后,按当前 query 构建只读投影行(§4)
+  if (state.search.active) {
+    const ok = await ensureSearchSnaps();
+    if (!ok || gen !== state.renderGen || state.tab !== "records") return;
+    renderSearchView();
+    return;
+  }
+
   const flat = await buildRecordsFlat();
+  if (gen !== state.renderGen || state.tab !== "records") return;
   state.recordsRows = flat;
   getList().setRows(flat);
   void hydrateIcons();
@@ -329,6 +363,7 @@ async function buildRecordsFlat() {
  */
 function refreshRecordsSync() {
   if (state.tab !== "records") return;
+  if (state.search.active) { renderSearchView(); return; }   // 搜索态编辑被禁用;防御性走搜索投影
   const placeholder = flattenRecords();
   const out = [];
   for (const r of placeholder) {
@@ -352,7 +387,13 @@ async function hydrateIcons() {
   for (const dot of imgs) {
     let pageUrl = dot.dataset.pageurl;          // 当前标签:直接带(P-25)
     if (!pageUrl && dot.dataset.iconkey) {
-      pageUrl = await getIcon(dot.dataset.iconkey);  // 快照:storage 取 pageUrl(P-21)
+      const key = dot.dataset.iconkey;
+      if (iconPageCache.has(key)) {
+        pageUrl = iconPageCache.get(key);        // 搜索期重渲染命中缓存,零 storage 读
+      } else {
+        pageUrl = await getIcon(key);            // 快照:storage 取 pageUrl(P-21)
+        iconPageCache.set(key, pageUrl || "");   // "" = 负缓存,避免反复读取缺失图标
+      }
     }
     if (pageUrl) {
       // 参照扩展:favicon 权限 + /_favicon/ 内部接口按 pageUrl 返回图片数据(无 CORS、离线可用)
@@ -418,6 +459,27 @@ function isDupContent(content, selfId) {
   return false;
 }
 
+/** 快照记录操作按钮工厂:普通行与搜索投影行共用,避免行为分叉。 */
+function recordGroupButtons(id) {
+  return [
+    // §3.3:title 让用户发现 Ctrl 手势
+    { cls: "open", label: "打开", title: "打开(按住 Ctrl 后台打开)", onClick: (e) => doOpenGroup(id, e) },
+    { cls: "del", label: "删除", onClick: () => doDelete(id) },
+  ];
+}
+function recordTabButtons(id) {
+  return [
+    { cls: "open", label: "打开", title: "打开(按住 Ctrl 后台打开)", onClick: (e) => doOpenTab(id, e) },
+    { cls: "del", label: "删除", onClick: () => doDelete(id) },
+  ];
+}
+function recordChildButtons(parentId, childId) {
+  return [
+    { cls: "open", label: "打开", title: "打开(按住 Ctrl 后台打开)", onClick: (e) => doOpenChild({ id: childId, parentId }, e) },
+    { cls: "del", label: "删除", onClick: () => doDeleteChild({ id: childId, parentId }) },
+  ];
+}
+
 /** 快照记录·顶层行绑定行为。 */
 function bindRecordRow(r) {
   if (r.kind === "group") {
@@ -428,11 +490,7 @@ function bindRecordRow(r) {
       onRenamed: (v) => renameIndexEntry(r.id, v),   // 同步更新内存 index(P-18/22)
       onRefresh: () => refreshRecordsSync(),          // 同步整 tab 刷新(P-18/22)
       onFlush: (v) => flushTopLevel(r.id, v),   // pagehide 同步直写(P-19)
-      buttons: [
-        // §3.3:title 让用户发现 Ctrl 手势
-        { cls: "open", label: "打开", title: "打开(按住 Ctrl 后台打开)", onClick: (e) => doOpenGroup(r.id, e) },
-        { cls: "del", label: "删除", onClick: () => doDelete(r.id) },
-      ],
+      buttons: recordGroupButtons(r.id),
     };
   }
   return {
@@ -445,10 +503,7 @@ function bindRecordRow(r) {
     isDupContent: (v) => isDupContent(v, r.id),
     onUrlEdit: (v) => doEditUrlTop(r.id, v),
     onUrlRejected: (msg) => toast(msg),
-    buttons: [
-      { cls: "open", label: "打开", title: "打开(按住 Ctrl 后台打开)", onClick: (e) => doOpenTab(r.id, e) },
-      { cls: "del", label: "删除", onClick: () => doDelete(r.id) },
-    ],
+    buttons: recordTabButtons(r.id),
   };
 }
 
@@ -480,11 +535,264 @@ function toRecordChildRow(c, parentId) {
     isDupContent: (v) => isDupContent(v, c.id),
     onUrlEdit: (v) => doEditUrlChild(parentId, c.id, v),
     onUrlRejected: (msg) => toast(msg),
-    buttons: [
-      { cls: "open", label: "打开", title: "打开(按住 Ctrl 后台打开)", onClick: (e) => doOpenChild({ id: c.id, parentId }, e) },
-      { cls: "del", label: "删除", onClick: () => doDeleteChild({ id: c.id, parentId }) },
-    ],
+    buttons: recordChildButtons(parentId, c.id),
   };
+}
+
+/* ============ 快照记录·正则搜索(design-v0.6 §4) ============ */
+// 纪律:搜索本身不写 storage;结果为只读投影行,展开只写临时 state.search.expanded。
+// 匹配字段:组标题 / 组内标签标题、url / 顶层标签标题、url;new RegExp(q,"i"),不用 g。
+
+let searchTimer = null;
+
+function searchEls() {
+  return {
+    input: document.getElementById("search-input"),
+    overlay: document.getElementById("search-overlay"),
+  };
+}
+
+function compileSearch(q) {
+  if (!q) return { re: null };
+  try { return { re: new RegExp(q, "i") }; }
+  catch { return { error: "正则表达式无效" }; }
+}
+
+function searchMatch(re, value) {
+  return re.test(value ?? "");
+}
+
+/** 搜索投影行:只读、不绑编辑/持久化展开;打开/删除沿用普通行行为。 */
+function toSearchGroupRow(e, expanded) {
+  return {
+    kind: "group", id: e.id, name: e.name, color: e.color, expanded,
+    readonly: true,
+    onToggle: () => toggleSearchExpand(e.id),   // 只写 search.expanded
+    buttons: recordGroupButtons(e.id),
+  };
+}
+function toSearchTabRow(e) {
+  return {
+    kind: "tab", id: e.id, name: e.name, iconKey: e.iconKey, url: e.url,
+    readonly: true,
+    buttons: recordTabButtons(e.id),
+  };
+}
+function toSearchChildRow(c, parentId) {
+  return {
+    kind: "tab", id: c.id, name: c.name, iconKey: c.iconKey, url: c.url,
+    child: true, parentId,
+    readonly: true,
+    buttons: recordChildButtons(parentId, c.id),
+  };
+}
+
+/** 全组快照缓存:进入搜索时一次读取;并发调用共享同一 Promise。 */
+async function ensureSearchSnaps() {
+  const s = state.search;
+  if (!s.active) return false;
+  if (s.snaps) return true;
+  if (s.snapsLoading) return s.snapsLoading;
+
+  const ids = state.index.filter((e) => e.type === "group").map((e) => e.id);
+  const p = getSnaps(ids)
+    .then((raw) => {
+      if (state.search !== s || !s.active) return false;   // 加载期间已退出/重进
+      s.snaps = raw;
+      return true;
+    })
+    .catch((e) => { console.warn("[search] 组快照加载失败:", e); return false; })
+    .finally(() => { if (s.snapsLoading === p) s.snapsLoading = null; });
+  s.snapsLoading = p;
+  return p;
+}
+
+/**
+ * 构建搜索投影列表(§4.5):
+ *  - 顶层标签:标题或 url 命中;
+ *  - 组:组标题命中或任一子标签命中;有 url 查询时,子标签只显示命中项,
+ *        组标题命中则视为整组命中(展开后显示全部子标签);
+ *  - 空查询:不过滤,展开态沿用 ui.expanded(视觉等同正常列表)。
+ */
+function buildSearchFlat() {
+  const s = state.search;
+  const re = s.re;
+  const out = [];
+  for (const e of orderForDisplay(state.index)) {
+    if (e.type === "tab") {
+      if (re && !searchMatch(re, e.name) && !searchMatch(re, e.url)) continue;
+      out.push(toSearchTabRow(e));
+      continue;
+    }
+
+    const snap = s.snaps?.[`snap:${e.id}`];
+    const children = snap?.children || [];
+    const titleHit = !re || searchMatch(re, e.name);
+    const hits = re
+      ? children.filter((c) => searchMatch(re, c.name) || searchMatch(re, c.url))
+      : children;
+    if (re && !titleHit && !hits.length) continue;
+
+    const expanded = Object.prototype.hasOwnProperty.call(s.expanded, e.id)
+      ? !!s.expanded[e.id]
+      : (re ? hits.length > 0 : !!state.ui.expanded[e.id]);
+    out.push(toSearchGroupRow(e, expanded));
+    if (expanded) {
+      // 组标题命中 = 整组命中 → 展开显示全部子标签;仅子标签命中 → 只显示命中子行
+      const visible = re && !titleHit ? hits : children;
+      for (const c of visible) out.push(toSearchChildRow(c, e.id));
+    }
+  }
+  return out;
+}
+
+/** 同步重绘搜索结果(缓存已就绪,零 await)。 */
+function renderSearchView({ resetScroll = false } = {}) {
+  if (state.tab !== "records" || !state.search.active) return;
+  state.renderGen++;                     // 使进行中的异步渲染失效
+  if (state.search.invalid) {
+    state.search.rows = [];
+    showEmpty("正则表达式无效,请检查输入");
+    syncFoldAllBtn();                    // 「全部」图标随当前结果刷新
+    if (resetScroll) getList().el.scrollTop = 0;
+    return;
+  }
+  const flat = buildSearchFlat();
+  state.search.rows = flat;
+  if (!flat.length) {
+    showEmpty(state.search.query ? "无匹配结果" : "暂无快照,去「当前标签」捕获");
+  } else {
+    getList().setRows(flat);
+    void hydrateIcons();
+  }
+  syncFoldAllBtn();                      // 搜索态「全部」按可见结果联动(0.7.1)
+  if (resetScroll) getList().el.scrollTop = 0;
+}
+
+/** 搜索态折叠/展开:只写临时覆盖,不写 ui.expanded、不落盘。 */
+function toggleSearchExpand(id) {
+  const row = state.search.rows.find((r) => r.kind === "group" && r.id === id);
+  const cur = Object.prototype.hasOwnProperty.call(state.search.expanded, id)
+    ? !!state.search.expanded[id]
+    : !!row?.expanded;
+  state.search.expanded[id] = !cur;
+  renderSearchView();
+}
+
+/** 覆盖层显隐 + 被遮住按钮的可用态(避免 Tab/Enter 误触导出/导入)。 */
+function showSearchOverlay(show) {
+  const { input, overlay } = searchEls();
+  if (overlay) overlay.hidden = !show;
+  for (const id of ["btn-search", "btn-export", "btn-import"]) {
+    const b = document.getElementById(id);
+    if (b) b.disabled = show;
+  }
+  // 「展开/收起全部」搜索态保持可用(0.7.1):作用于当前结果,见 onFoldAllClick / anyGroupExpanded
+  if (!show && input) {
+    input.value = "";
+    input.classList.remove("invalid");
+  }
+}
+
+async function enterSearch() {
+  const s = state.search;
+  if (s.active || state.tab !== "records") return;
+  s.active = true;
+  s.gen++;
+  s.query = "";
+  s.re = null;
+  s.invalid = false;
+  s.composing = false;
+  s.snaps = null;
+  s.snapsLoading = null;
+  s.rows = [];
+  s.expanded = {};
+  s.prevScroll = getList().el.scrollTop;
+
+  showSearchOverlay(true);
+  const { input } = searchEls();
+  input.value = "";
+  input.focus();
+
+  const ok = await ensureSearchSnaps();
+  if (!ok || !state.search.active || state.tab !== "records") return;
+  renderSearchView({ resetScroll: true });
+}
+
+/** 退出搜索:清状态、恢复按钮、恢复正常列表与原滚动位置。 */
+function exitSearch({ rerender = true } = {}) {
+  const s = state.search;
+  if (!s.active) return;
+  const prev = s.prevScroll || 0;
+  s.gen++;
+  s.active = false;
+  s.query = "";
+  s.re = null;
+  s.invalid = false;
+  s.composing = false;
+  s.snaps = null;
+  s.snapsLoading = null;
+  s.rows = [];
+  s.expanded = {};
+  s.prevScroll = 0;
+  clearTimeout(searchTimer);
+  searchTimer = null;
+  showSearchOverlay(false);
+
+  if (rerender && state.tab === "records") {
+    void renderRecords().then(() => {
+      if (state.tab === "records" && !state.search.active) getList().el.scrollTop = prev;
+    });
+  }
+}
+
+function onSearchInput() {
+  if (!state.search.active || state.search.composing) return;
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(applySearchQuery, 120);   // 120ms 防抖,与 scheduleRefresh 一致
+}
+
+function applySearchQuery() {
+  if (!state.search.active) return;
+  const { input } = searchEls();
+  const q = input.value;
+  state.search.query = q;
+  state.search.expanded = {};                        // D8:查询变化清空临时展开
+  const c = compileSearch(q);
+  state.search.re = c.re || null;
+  state.search.invalid = !!c.error;
+  input.classList.toggle("invalid", state.search.invalid);
+  renderSearchView({ resetScroll: true });
+}
+
+/** 搜索交互绑定:按钮 / 输入 / 失焦 / Esc / IME / 结果行点击保护。 */
+function bindSearchInteractions() {
+  const { input } = searchEls();
+  document.getElementById("btn-search").addEventListener("click", () => { void enterSearch(); });
+
+  input.addEventListener("input", onSearchInput);
+  input.addEventListener("compositionstart", () => { state.search.composing = true; });
+  input.addEventListener("compositionend", () => {
+    state.search.composing = false;
+    onSearchInput();
+  });
+  // 需求:焦点离开后退出搜索。点击结果行时通过取消 mousedown 默认聚焦保住输入焦点,
+  // 否则 blur → 同步重渲染会在 mouseup/click 前销毁按钮,导致「打开/删除」点击丢失。
+  input.addEventListener("blur", () => { if (state.search.active) exitSearch(); });
+  input.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    e.preventDefault();
+    exitSearch();
+    input.blur();
+  });
+  document.getElementById("list").addEventListener("mousedown", (e) => {
+    if (!state.search.active) return;
+    if (e.target.closest(".row")) e.preventDefault();
+  }, true);
+  // 搜索态点击「展开/收起全部」也不能让输入框失焦,否则 click 前已退出搜索、作用到全量列表
+  document.getElementById("btn-fold-all").addEventListener("mousedown", (e) => {
+    if (state.search.active) e.preventDefault();
+  });
 }
 
 /* ============ 操作 ============ */
@@ -585,11 +893,17 @@ async function doEditUrlChild(groupId, childId, url) {
 
 async function doDelete(id) {
   const r = await deleteSnapshot(id);
-  if (r.ok) { toast("已删除"); await reloadIndex(); await renderRecords(); }
+  if (r.ok) {
+    if (state.search.active) state.search.snaps = null;   // 搜索缓存失效,重读组快照
+    toast("已删除"); await reloadIndex(); await renderRecords();
+  }
 }
 async function doDeleteChild(row) {
   const r = await deleteChild(row.parentId, row.id);
-  if (r.ok) { toast("已从分组中删除"); await reloadIndex(); await renderRecords(); }
+  if (r.ok) {
+    if (state.search.active) state.search.snaps = null;
+    toast("已从分组中删除"); await reloadIndex(); await renderRecords();
+  }
 }
 
 /** 组内标签重命名:仅改 snap.children 中对应项,不改 index(其他问题2)。 */
@@ -690,6 +1004,7 @@ function bindTabs() {
     btn.addEventListener("click", async () => {
       const t = btn.dataset.tab;
       if (t === state.tab) return;
+      exitSearch({ rerender: false });   // 切 tab 显式退出搜索(不依赖 blur 副作用)
       state.tab = t;
       syncTabs();
       // 不再持久化 activeTab(问题1:每次展开始终回到当前标签)
@@ -710,6 +1025,10 @@ function syncTabs() {
 function anyGroupExpanded() {
   if (state.tab === "current") {
     return state.currentRows.some((r) => r.kind === "group" && !r.collapsed);  // Chrome 真值(P-29 单一真相)
+  }
+  if (state.search.active) {
+    // 搜索态:以当前结果行的实际展开态为准(含临时 search.expanded 覆盖)
+    return state.search.rows.some((r) => r.kind === "group" && r.expanded);
   }
   return state.index.some((e) => e.type === "group" && state.ui.expanded[e.id]);
 }
@@ -734,6 +1053,13 @@ async function onFoldAllClick() {
     // 当前标签:写 Chrome 全部 → 重读渲染(单一真相,照参照;§13 兜底)
     await toggleAllBrowserGroups(!expand);
     await renderCurrent();
+  } else if (state.search.active) {
+    // 搜索态(0.7.1):只作用于当前结果中可见的组,写临时展开、不落盘,搜索保持打开
+    for (const r of state.search.rows) {
+      if (r.kind === "group") state.search.expanded[r.id] = expand;
+    }
+    renderSearchView();            // 内部会重算行并 syncFoldAllBtn
+    return;
   } else {
     // 快照记录:本地快照列表,仅作用于本 tab,不触碰 Chrome(P-28)
     for (const e of state.index) {
@@ -797,6 +1123,7 @@ async function onImportFile(e) {
     if (!r.ok) { toast(`校验失败:${r.error}`); return; }
     toast("导入成功");
     await reloadIndex();
+    exitSearch({ rerender: false });   // 导入后不复用旧 query(通常不可达,防御)
     state.tab = "records"; syncTabs();
     await renderRecords();
   } catch (err) { console.error(err); toast("导入失败"); }

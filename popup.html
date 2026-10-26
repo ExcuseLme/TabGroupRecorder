@@ -23,11 +23,18 @@
     <div class="actions" id="capture-all-wrap">
       <button class="text-btn" id="btn-capture-all">捕获全部</button>
     </div>
-    <!-- 快照记录 tab:纯文本导出/导入(补充需求2) -->
+    <!-- 快照记录 tab:正则搜索 + 纯文本导出/导入 -->
     <div class="actions" id="header-actions" hidden>
+      <button class="text-btn" id="btn-search" title="搜索快照(正则)">搜索</button>
       <button class="text-btn" id="btn-export">导出</button>
       <button class="text-btn" id="btn-import">导入</button>
       <input type="file" id="import-file" accept="application/json,.json" hidden />
+
+      <!-- 搜索覆盖层:绝对定位覆盖「搜索/导出/导入」三按钮;从搜索按钮左缘向右展开 -->
+      <div class="search-overlay" id="search-overlay" hidden>
+        <input type="text" id="search-input" placeholder="正则搜索…" spellcheck="false"
+               autocomplete="off" maxlength="512" aria-label="正则搜索快照" />
+      </div>
     </div>
   </header>
 

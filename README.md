@@ -13,6 +13,7 @@ A lightweight Chrome extension for capturing, browsing, and restoring browser ta
 - **Expand / collapse** tab groups in sync with Chrome (per-row and "expand/collapse all"), while snapshot records keep their own local state independent of Chrome.
 - **Favicons** rendered via Chrome's internal `/_favicon/` endpoint (works for `localhost` and `chrome://` pages, offline-friendly, no CORS issues).
 - **Export / import** snapshots as JSON — schema-validated import with overwrite mode and automatic backup; export triggers a standard browser download.
+- **Regex search** in snapshot records — search group titles, group-child titles/URLs, and standalone tab titles/URLs; the list filters in place, and the search box covers the header buttons while focused.
 - **Fast startup** — the popup renders a static shell first (zero async), then loads data and lazy-loads icons, so opening the panel is never blocked by data loading.
 
 ## Requirements
@@ -34,7 +35,7 @@ No build step required — the extension is plain JavaScript.
 | Tab | Description |
 |---|---|
 | **当前标签 (Current Tabs)** | Live view of all tabs and groups in the current window. Use **捕获 (Capture)** per row, or **捕获全部 (Capture All)** in the header, to save snapshots. |
-| **快照记录 (Snapshot Records)** | Browse saved snapshots. Open / delete / rename entries; expand/collapse groups locally. Header offers **导出 (Export)** and **导入 (Import)**. |
+| **快照记录 (Snapshot Records)** | Browse saved snapshots newest-first. Open / delete / rename entries; expand/collapse groups locally. Header offers **搜索 (Regex Search)**, **导出 (Export)** and **导入 (Import)**. |
 
 Group rows show their group color; tab rows show their favicon. The `<>` / `><` icons indicate click-to-expand / click-to-collapse.
 
