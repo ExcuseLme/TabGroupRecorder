@@ -459,23 +459,25 @@ function isDupContent(content, selfId) {
   return false;
 }
 
+// 0.7.2:打开一律在后台(不转移焦点 → 面板保持开启),不再区分修饰键。
+const OPEN_TITLE = "打开(后台打开)";
+
 /** 快照记录操作按钮工厂:普通行与搜索投影行共用,避免行为分叉。 */
 function recordGroupButtons(id) {
   return [
-    // §3.3:title 让用户发现 Ctrl 手势
-    { cls: "open", label: "打开", title: "打开(按住 Ctrl 后台打开)", onClick: (e) => doOpenGroup(id, e) },
+    { cls: "open", label: "打开", title: OPEN_TITLE, onClick: () => doOpenGroup(id) },
     { cls: "del", label: "删除", onClick: () => doDelete(id) },
   ];
 }
 function recordTabButtons(id) {
   return [
-    { cls: "open", label: "打开", title: "打开(按住 Ctrl 后台打开)", onClick: (e) => doOpenTab(id, e) },
+    { cls: "open", label: "打开", title: OPEN_TITLE, onClick: () => doOpenTab(id) },
     { cls: "del", label: "删除", onClick: () => doDelete(id) },
   ];
 }
 function recordChildButtons(parentId, childId) {
   return [
-    { cls: "open", label: "打开", title: "打开(按住 Ctrl 后台打开)", onClick: (e) => doOpenChild({ id: childId, parentId }, e) },
+    { cls: "open", label: "打开", title: OPEN_TITLE, onClick: () => doOpenChild({ id: childId, parentId }) },
     { cls: "del", label: "删除", onClick: () => doDeleteChild({ id: childId, parentId }) },
   ];
 }
@@ -807,27 +809,15 @@ async function doCapture(row) {
   }
 }
 
-/**
- * §3.2 取修饰键:Ctrl(Win/Linux)或 Cmd(macOS)→ 后台打开。
- * @returns {boolean} true = 后台打开(不转移焦点,面板保持开启)
- */
-function isBackgroundOpen(e) {
-  return !!(e?.ctrlKey || e?.metaKey);
-}
+/* ============ 打开(0.7.2:一律后台,面板保持开启) ============ */
+// 后台打开 = chrome.tabs.create({ active:false }):不转移焦点 → popup 不被销毁。
+// 不再读取 Ctrl/Cmd 修饰键(0.5.0 的「Ctrl 后台打开」已成为唯一且默认的行为)。
 
-/** §3.3 首次使用提示(仅一次):让用户发现 Ctrl 手势。 */
-function maybeTipCtrl() {
-  if (state.ui.ctrlTipShown) return;
-  state.ui.ctrlTipShown = true;
-  toast("提示:按住 Ctrl 点击「打开」可在后台打开并保持面板");
-  try { chrome.storage.local.set({ ui: state.ui }); } catch { /* 忽略 */ }
-}
-
-/** 统一处理打开结果反馈(§3.3 / §2.8)。 */
-function handleOpenResult(r, foreground) {
+/** 统一处理打开结果反馈(§2.8)。 */
+function handleOpenResult(r) {
   if (!r) return;
   if (r.ok) {
-    if (!foreground) toast("已后台打开(面板保持开启)");
+    toast("已后台打开");
     return;
   }
   if (r.copy) {
@@ -840,27 +830,21 @@ function handleOpenResult(r, foreground) {
   toast(r.error || "打开失败");
 }
 
-async function doOpenTab(id, e) {
+async function doOpenTab(id) {
   const s = await findSnap(id);
   if (!s) return;
-  const bg = isBackgroundOpen(e);
-  maybeTipCtrl();
-  handleOpenResult(await openTabSnapshot(s, { foreground: !bg }), !bg);
+  handleOpenResult(await openTabSnapshot(s));
 }
-async function doOpenGroup(id, e) {
+async function doOpenGroup(id) {
   const s = await findSnap(id);
   if (!s) return;
-  const bg = isBackgroundOpen(e);
-  maybeTipCtrl();
-  handleOpenResult(await openGroupSnapshot(s, { foreground: !bg }), !bg);
+  handleOpenResult(await openGroupSnapshot(s));
 }
-async function doOpenChild(row, e) {
+async function doOpenChild(row) {
   const g = await findSnap(row.parentId);
   const c = g?.children?.find((x) => x.id === row.id);
   if (!g || !c) return;
-  const bg = isBackgroundOpen(e);
-  maybeTipCtrl();
-  handleOpenResult(await openChildSnapshot(g, c, { foreground: !bg }), !bg);
+  handleOpenResult(await openChildSnapshot(g, c));
 }
 
 /* ============ §2.4 URL 编辑 ============ */

@@ -52,7 +52,6 @@
  * @property {Record<string, boolean>} expanded
  * @property {number} [scroll]
  * @property {number} [panelHeight]   面板高度(px);缺省 = 随内容自适应(docs/design-v0.5 §1.6)
- * @property {boolean} [ctrlTipShown] 是否已展示过「Ctrl 后台打开」一次性提示(§3.3)
  */
 
 export const SCHEMA_VERSION = 1;

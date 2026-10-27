@@ -199,16 +199,16 @@ async function sha1(text) {
 /* ================= §6 打开 ================= */
 // §2.8:保存宽松 → 打开时统一翻译;不可导航内容不抛错,给明确失败信息。
 // P-38:不做协议白名单,候选逐个试,由 Chrome 判定能否打开。
-// §3:foreground=false 时后台打开(不转移焦点,popup 不关闭)。
+// 0.7.2:一律**后台**打开(active:false)—— 不转移焦点,popup 不关闭;
+// 不再有前台打开分支,也不再读取 Ctrl/Cmd 修饰键。
 
 /**
- * 依次尝试候选 URL 打开;任一成功即返回。
+ * 依次尝试候选 URL 在**后台**打开;任一成功即返回。
  * **不做协议准入判断** —— data:/javascript:/chrome: 等一律交给 Chrome 决定(P-38)。
  * @param {string} rawUrl
- * @param {{foreground?:boolean}} opts
  * @returns {Promise<{ok:boolean, error?:string, copy?:string}>}
  */
-async function openOne(rawUrl, { foreground = true } = {}) {
+async function openOne(rawUrl) {
   const cands = urlCandidates(rawUrl);
   if (!cands.length) {
     const bm = isBookmarklet(rawUrl) ? (rawUrl ?? "").trim() : null;
@@ -224,7 +224,7 @@ async function openOne(rawUrl, { foreground = true } = {}) {
   let lastErr = null;
   for (const target of cands) {
     try {
-      await chrome.tabs.create({ url: target, active: foreground });
+      await chrome.tabs.create({ url: target, active: false });
       return { ok: true };
     } catch (e) {
       lastErr = e;
@@ -242,26 +242,26 @@ async function openOne(rawUrl, { foreground = true } = {}) {
   };
 }
 
-/** 独立标签快照:新标签页打开其 URL。 */
-export async function openTabSnapshot(snap, opts) {
-  return openOne(snap.url, opts);
+/** 独立标签快照:后台打开其 URL(新标签页)。 */
+export async function openTabSnapshot(snap) {
+  return openOne(snap.url);
 }
 
-/** 分组快照:创建同名同色组并在组内打开全部标签。 */
-export async function openGroupSnapshot(snap, opts) {
-  return openGroupByName(snap.name, snap.color, snap.children.map((c) => c.url), opts);
+/** 分组快照:创建同名同色组并在组内**后台**打开全部标签。 */
+export async function openGroupSnapshot(snap) {
+  return openGroupByName(snap.name, snap.color, snap.children.map((c) => c.url));
 }
 
-/** 组内标签快照:在同名组(存在则复用)中打开该标签。 */
-export async function openChildSnapshot(groupSnap, child, opts) {
-  return openGroupByName(groupSnap.name, groupSnap.color, [child.url], opts);
+/** 组内标签快照:在同名组(存在则复用)中**后台**打开该标签。 */
+export async function openChildSnapshot(groupSnap, child) {
+  return openGroupByName(groupSnap.name, groupSnap.color, [child.url]);
 }
 
 /**
- * 按组名打开若干 URL(复用同窗口同名组)。
- * @param {boolean} opts.foreground true=建完激活首个;false=全部后台,pupup 保持开启
+ * 按组名在**后台**打开若干 URL(复用同窗口同名组);
+ * 不激活任何标签、不抢焦点 → popup 保持开启。
  */
-async function openGroupByName(name, color, urls, { foreground = true } = {}) {
+async function openGroupByName(name, color, urls) {
   // 逐个 URL 取候选列表(P-38:不做协议白名单)
   const plan = [];
   let skipped = 0;
@@ -281,7 +281,7 @@ async function openGroupByName(name, color, urls, { foreground = true } = {}) {
     if (hit) groupId = hit.id;
   } catch { /* §13 兜底:查询失败则新建 */ }
 
-  // 关键:一律先以后台方式创建,避免 N 个标签依次抢焦点(前台时最后只激活首个)
+  // 全部以后台方式创建:不切换当前标签、不抢焦点,N 个标签一次开完面板仍在
   const tabIds = [];
   for (const cands of plan) {
     let created = false;
@@ -315,11 +315,7 @@ async function openGroupByName(name, color, urls, { foreground = true } = {}) {
     }
   }
 
-  // 前台模式:只激活首个(§3.4 避免批量抢焦点)
-  if (foreground && tabIds.length) {
-    try { await chrome.tabs.update(tabIds[0], { active: true }); } catch { /* 忽略 */ }
-  }
-
+  // 0.7.2:不激活任何标签 —— 后台打开,面板保持开启
   return { ok: true, count: tabIds.length, skipped };
 }
 

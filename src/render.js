@@ -132,7 +132,7 @@ function buildRow(row) {
     btn.className = `btn ${b.cls}`;
     btn.textContent = b.label;
     if (b.title) btn.title = b.title;
-    // 透传事件对象:供 Ctrl 后台打开读取修饰键(§3.2)
+    // 透传事件对象:按钮回调可自行判断(0.7.2 起「打开」一律后台,不再读取修饰键)
     btn.addEventListener("click", (e) => { e.stopPropagation(); b.onClick(e); });
     tools.appendChild(btn);
   }
