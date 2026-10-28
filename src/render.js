@@ -60,6 +60,13 @@ function buildRow(row) {
   const div = document.createElement("div");
   div.className = "row" + (row.child ? " child" : "") + (row.url ? " has-url" : "");
 
+  // 行身份/可拖标识(v0.8 拖拽排序):drag.js 只读这些 dataset,不依赖行模型闭包
+  div.dataset.kind = row.kind;
+  if (row.id != null) div.dataset.id = String(row.id);
+  if (row.parentId) div.dataset.parent = String(row.parentId);
+  if (row.child) div.dataset.child = "1";
+  if (row.draggable) div.dataset.drag = "1";
+
   const dot = document.createElement("div");
   dot.className = "dot";
   if (row.color) {
@@ -85,6 +92,7 @@ function buildRow(row) {
 
   // 分组行:状态图标 <> / ><
   if (row.kind === "group") {
+    div.dataset.expanded = row.expanded ? "1" : "0";   // 拖拽悬停自动展开用(v0.8)
     const ic = document.createElement("span");
     ic.className = "state-icon";
     ic.title = row.expanded ? "点击后收起" : "点击后展开";

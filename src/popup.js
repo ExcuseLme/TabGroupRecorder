@@ -10,9 +10,11 @@ import {
   renameSnapshot, deleteSnapshot, deleteChild,
   toggleAllBrowserGroups,
   updateTabUrl, updateChildUrl,
+  applyDrop,
 } from "./operations.js";
 import { buildExportObject, triggerDownload, importOverwrite } from "./transfer.js";
 import { VirtualList, renderSkeleton, clearSkeleton } from "./render.js";
+import { bindRowDrag } from "./drag.js";
 import { orderForDisplay } from "./merge.js";
 
 /** 「展开/折叠全部」按钮图标(纵向双箭头,与状态图标风格一致)。 */
@@ -282,11 +284,12 @@ function flattenRecords() {
   for (const e of orderForDisplay(state.index)) {
     const expanded = !!state.ui.expanded[e.id];
     if (e.type === "group") {
-      out.push({ kind: "group", id: e.id, name: e.name, color: e.color, expanded, _grp: true });
+      // v0.8:顶层条目可拖拽(整组移动,children 跟随)
+      out.push({ kind: "group", id: e.id, name: e.name, color: e.color, expanded, _grp: true, draggable: true });
       if (expanded) out.push({ _needSnap: e.id });
     } else {
       // §2.3:顶层标签快照带 url → 渲染第二行(来自 index,零额外读取)
-      out.push({ kind: "tab", id: e.id, name: e.name, iconKey: e.iconKey, url: e.url });
+      out.push({ kind: "tab", id: e.id, name: e.name, iconKey: e.iconKey, url: e.url, draggable: true });
     }
   }
   return out;
@@ -398,7 +401,7 @@ async function hydrateIcons() {
     if (pageUrl) {
       // 参照扩展:favicon 权限 + /_favicon/ 内部接口按 pageUrl 返回图片数据(无 CORS、离线可用)
       const src = `/_favicon/?pageUrl=${encodeURIComponent(pageUrl)}&size=36`;
-      dot.innerHTML = `<img src="${src}" alt="" />`;
+      dot.innerHTML = `<img src="${src}" alt="" draggable="false" />`;   // v0.8:禁原生图片拖拽抢行拖拽
     }
     dot.setAttribute("data-iconed", "1");
   }
@@ -525,7 +528,7 @@ function renameIndexEntry(id, name) {
 function toRecordChildRow(c, parentId) {
   return {
     kind: "tab", id: c.id, name: c.name, iconKey: c.iconKey, url: c.url,
-    child: true, parentId,
+    child: true, parentId, draggable: true,
     onRename: (v) => renameChild(parentId, c.id, v),
     onRenamed: (v) => {                                   // 同步缓存(P-17)
       const x = state.recordsRows.find((t) => t.id === c.id);
@@ -916,6 +919,26 @@ async function findSnap(id) {
   return map[`snap:${id}`];
 }
 
+/* ============ v0.8 拖拽排序(design-v0.8.md) ============ */
+/** 拖拽落点 → 持久化 → 重读 index 并整表重渲染;失败 toast 且回到存储真实状态。 */
+async function handleRowDrop(source, drop) {
+  const r = await applyDrop(source, drop);
+  if (!r.ok) {
+    toast(r.error || "移动失败");
+    return r;
+  }
+  if (r.changed) {
+    await reloadIndex();
+    await renderRecords();
+  }
+  return r;
+}
+
+/** 拖动悬停在折叠组上 → 展开(只展开,不收起;展开态本身是持久化 UI 状态)。 */
+function expandGroupForDrag(groupId) {
+  if (!state.ui.expanded[groupId]) void toggleExpand(groupId);
+}
+
 /* ============ P-19:pagehide 同步落盘 ============ */
 /**
  * 顶层快照(独立标签/组):pagehide 时**同步**读改写,不走 renameSnapshot 的异步读链。
@@ -1129,4 +1152,11 @@ function toast(msg) {
 
 /* ============ 启动 ============ */
 vlist = new VirtualList(document.getElementById("list"));
+// v0.8:快照记录行拖拽排序 / 跨组移动(仅在 records tab 且非搜索态可用)
+bindRowDrag({
+  list: document.getElementById("list"),
+  canStart: () => state.tab === "records" && !state.search.active,
+  onDrop: handleRowDrop,
+  onAutoExpand: expandGroupForDrag,
+});
 boot();

@@ -135,6 +135,7 @@ html.resizing, html.resizing * { cursor: ns-resize !important; user-select: none
      底部留 4px:避免最后一行紧贴抓手(行自带 2px margin,合计 6px 呼吸空间)。 */
   padding: 0 12px 4px;
   background: var(--bg);
+  position: relative;   /* 拖拽插入线(v0.8)的绝对定位基准 */
 }
 .list:focus { outline: none; }
 
@@ -239,6 +240,32 @@ html.resizing, html.resizing * { cursor: ns-resize !important; user-select: none
 .btn.open { background: var(--open-bg); color: var(--cap-fg); }
 .btn.del { background: var(--del-bg); color: var(--del-fg); }
 .btn:disabled { opacity: .5; cursor: default; }
+
+/* ===== 行拖拽排序(v0.8,design-v0.8.md §5) =====
+   可拖区 = 行内非交互元素区域;名称/地址/按钮/展开图标保持各自 cursor 与行为。
+   拖动中:原行变淡占位,ghost 跟随指针,插入线/组高亮指示落点。 */
+.row[data-drag="1"] { cursor: grab; }
+.row-title, .url-field, .url-input { cursor: text; }   /* 优先于行的 grab */
+html.row-dragging, html.row-dragging * {
+  cursor: grabbing !important;
+  user-select: none !important;
+}
+.row.drag-source { opacity: .35; }
+.drag-ghost {
+  position: fixed; z-index: 80; pointer-events: none; opacity: .95;
+  background: #fff; border-radius: 6px; overflow: hidden;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .18);
+}
+.drop-indicator {
+  position: absolute; left: 8px; right: 8px; height: 2px;
+  background: var(--blue); border-radius: 1px; z-index: 60; pointer-events: none;
+}
+/* 子级插入(v0.9):线缩进到子项内容线,与「组之间的顶级插入」通栏线明显区分 */
+.drop-indicator.child { left: 40px; }
+/* 组内落点:组行描边 + 组块淡底色,明确「放进哪个组」 */
+.row.drop-group { background: #eff6ff; }
+.row[data-kind="group"].drop-group { outline: 2px solid var(--blue); outline-offset: -2px; }
+.dot img { -webkit-user-drag: none; }
 
 /* 空态 */
 .empty { padding: 40px 16px; text-align: center; color: var(--text-2); font-size: 12px; }

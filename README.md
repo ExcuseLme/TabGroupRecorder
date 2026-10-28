@@ -8,6 +8,7 @@ A lightweight Chrome extension for capturing, browsing, and restoring browser ta
 
 - **Capture** the current window's tabs and tab groups as snapshots — one at a time or all at once.
 - **Snapshot records** — browse saved tab/group snapshots with the **newest capture first**; open, delete, and rename them in place.
+- **Drag to reorder** — drag any snapshot row by its empty areas (not the name, URL, expand icon, or action buttons) to reorder group snapshots, standalone tab snapshots, and tabs inside a group; drag a child tab out of its group into the top level, or into another group (collapsed groups auto-expand on hover). Order is persisted and carried by export/import.
 - **Smart capture de-duplication** — standalone tabs are de-duplicated by URL, groups by name. Re-capturing a group **only adds**: tabs captured this time come first (in Chrome's current order), while existing tabs missing from this capture are kept in their relative order at the bottom — never dropped. A tab captured inside a group is merged into that group's snapshot (never losing sibling tabs).
 - **Open** a standalone tab, a whole group, or a single tab from within a group — always **in the background** (focus stays in the popup, so the panel stays open and you can open several in a row), reusing an existing same-name group in the current window when present.
 - **Expand / collapse** tab groups in sync with Chrome (per-row and "expand/collapse all"), while snapshot records keep their own local state independent of Chrome.
@@ -47,8 +48,9 @@ popup.html / popup.css   Static shell, layout, styles
 src/
   popup.js            App entry: render pipeline, tab switching, fold controls
   capture.js          Reads current window tabs/groups from Chrome APIs
-  operations.js       Capture / open / rename / delete / collapse logic
+  operations.js       Capture / open / rename / delete / collapse / drag-drop reorder logic
   merge.js            Pure ordering + group-children merge rules (no DOM/chrome deps)
+  drag.js             Snapshot-row drag controller (pointer state machine, drop targets)
   storage.js          Layered chrome.storage.local access (meta/index/snap:*/icon:*)
   transfer.js         JSON export (a[download]) + import with schema validation
   render.js           List rendering, state icons, in-place rename

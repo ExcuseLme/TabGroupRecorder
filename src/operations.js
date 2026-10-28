@@ -7,7 +7,10 @@ import {
 } from "./storage.js";
 import { currentWindowId } from "./capture.js";
 import { urlCandidates, isBookmarklet, valueToSave } from "./url.js";
-import { mergeGroupChildren } from "./merge.js";
+import {
+  mergeGroupChildren, insertAt, moveWithin,
+  toDisplayOrder, toStorageOrder, sameIdOrder,
+} from "./merge.js";
 
 const newId = () =>
   (crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -427,4 +430,212 @@ export async function toggleAllBrowserGroups(collapsed) {
     console.warn("[tabGroups.query all] 失败:", e);
     return 0;
   }
+}
+
+/* ================= 拖拽排序 / 跨组移动(v0.8.0,design-v0.8.md §6) ================= */
+// source/drop 由 src/drag.js 按行 DOM 计算;本模块只做「校验 → 纯函数规划 → 一次原子写」。
+// 纪律:
+//  - 一次逻辑操作 = 一次 writeBatch(§4.7);
+//  - 需要删 key 的操作(降级)先写后删:写失败最多留下孤儿 key,绝不会让 index 引用悬空;
+//  - 落点等于原位 → changed:false,不写盘。
+
+/**
+ * 对一次拖拽落点执行持久化。
+ * @param {{kind:'group'|'tab'|'child', id:string, parentId?:string}} source
+ * @param {{kind:'top', pos:number}
+ *       | {kind:'child', groupId:string, pos:number}
+ *       | {kind:'into', groupId:string}} drop   // into = 追加到该组末尾(真实 children.length)
+ * @returns {Promise<{ok:boolean, changed?:boolean, error?:string}>}
+ */
+export async function applyDrop(source, drop) {
+  try {
+    if (!source || !drop || !source.id) return { ok: false, error: "无效的拖拽" };
+    const index = await loadIndex();
+    if (!Array.isArray(index)) return { ok: false, error: "快照数据异常" };
+
+    if (source.kind === "child") {
+      if (!source.parentId) return { ok: false, error: "来源标签组缺失" };
+      return dropFromChild(source, drop, index);
+    }
+    if (source.kind !== "group" && source.kind !== "tab") {
+      return { ok: false, error: "无效条目" };
+    }
+    return dropFromTopLevel(source, drop, index);
+  } catch (e) {
+    console.error("[applyDrop] 失败:", e);
+    return { ok: false, error: "移动失败" };
+  }
+}
+
+/** 顶层条目(group/tab)作为拖动来源。 */
+async function dropFromTopLevel(source, drop, index) {
+  const i = index.findIndex((e) => e.id === source.id);
+  if (i === -1) return { ok: false, error: "未找到该快照" };
+  const entry = index[i];
+
+  if (drop.kind === "child" || drop.kind === "into") {
+    // 仅两级:标签组不能拖入标签组(拖拽层不会产生该落点,此处防御)
+    if (entry.type !== "tab") return { ok: false, error: "标签组不能拖入标签组" };
+    return demoteTopTab(entry, drop, index);
+  }
+  if (drop.kind !== "top") return { ok: false, error: "无效落点" };
+
+  // 顶层重排:展示序 → 移动 → 反写 index
+  const display = toDisplayOrder(index);
+  const from = display.findIndex((e) => e.id === entry.id);
+  if (from === -1) return { ok: false, error: "未找到该快照" };
+  const nextDisplay = moveWithin(display, from, drop.pos);
+  if (sameIdOrder(display, nextDisplay)) return { ok: true, changed: false };
+  const next = toStorageOrder(nextDisplay);
+  await writeBatch({ index: next, meta: buildMeta(next) });
+  return { ok: true, changed: true };
+}
+
+/** 顶层标签快照 → 降级进组(与「子项提升」对称)。 */
+async function demoteTopTab(entry, drop, index) {
+  const tgid = drop.groupId;
+  const tIdx = index.findIndex((e) => e.id === tgid && e.type === "group");
+  if (tIdx === -1) return { ok: false, error: "目标标签组不存在" };
+  const { [`snap:${tgid}`]: dstSnap } = await getSnaps([tgid]);
+  if (!dstSnap || !Array.isArray(dstSnap.children)) {
+    return { ok: false, error: "目标标签组数据缺失" };
+  }
+  const { [`snap:${entry.id}`]: tabSnap } = await getSnaps([entry.id]);
+  if (!tabSnap) return { ok: false, error: "未找到该快照" };
+
+  const now = Date.now();
+  const child = {
+    id: entry.id,
+    type: "tab",
+    name: tabSnap.name ?? entry.name,
+    url: tabSnap.url ?? entry.url ?? "",
+    iconKey: tabSnap.iconKey ?? entry.iconKey ?? null,
+    createdAt: tabSnap.createdAt ?? now,
+    updatedAt: tabSnap.updatedAt ?? now,
+  };
+  const pos = drop.kind === "into" ? dstSnap.children.length : drop.pos;
+  const dstChildren = insertAt(dstSnap.children, pos, child);
+  const nextDisplay = toDisplayOrder(index).filter((e) => e.id !== entry.id);
+  const next = toStorageOrder(nextDisplay);
+  const ti = next.findIndex((e) => e.id === tgid);
+  if (ti !== -1) next[ti] = { ...next[ti], childCount: dstChildren.length, updatedAt: now };
+
+  await writeBatch({
+    [`snap:${tgid}`]: { ...dstSnap, children: dstChildren, updatedAt: now },
+    index: next,
+    meta: buildMeta(next),
+  });
+  // 快照内容已并入 children:先写成功再删顶层 key;删除失败只会是孤儿 key(不破坏导出/导入)
+  try {
+    await removeSnaps([entry.id]);
+  } catch (e) {
+    console.warn("[applyDrop] 删除旧快照 key 失败(孤儿 key,不影响索引):", e);
+  }
+  return { ok: true, changed: true };
+}
+
+/** 组内标签(child)作为拖动来源。 */
+async function dropFromChild(source, drop, index) {
+  const gid = source.parentId;
+  const srcIdx = index.findIndex((e) => e.id === gid && e.type === "group");
+  if (srcIdx === -1) return { ok: false, error: "来源标签组不存在" };
+  const { [`snap:${gid}`]: srcSnap } = await getSnaps([gid]);
+  if (!srcSnap || !Array.isArray(srcSnap.children)) {
+    return { ok: false, error: "来源标签组数据缺失" };
+  }
+  const from = srcSnap.children.findIndex((c) => c.id === source.id);
+  if (from === -1) return { ok: false, error: "未找到该标签" };
+
+  if (drop.kind === "child" || drop.kind === "into") {
+    return moveChildToGroup(source, drop, index, srcSnap, from, srcIdx);
+  }
+  if (drop.kind === "top") return promoteChild(source, drop, index, srcSnap, from);
+  return { ok: false, error: "无效落点" };
+}
+
+/** 组内重排 / 跨组移动。 */
+async function moveChildToGroup(source, drop, index, srcSnap, from, srcIdx) {
+  const gid = source.parentId;
+
+  // 同组重排(含「进入组末尾」:into 一律按真实 children.length 追加)
+  if (drop.groupId === gid) {
+    const pos = drop.kind === "into" ? srcSnap.children.length : drop.pos;
+    const nextChildren = moveWithin(srcSnap.children, from, pos);
+    if (sameIdOrder(srcSnap.children, nextChildren)) return { ok: true, changed: false };
+    await writeBatch({
+      [`snap:${gid}`]: { ...srcSnap, children: nextChildren, updatedAt: Date.now() },
+    });
+    return { ok: true, changed: true };
+  }
+
+  // 跨组移动
+  const tgid = drop.groupId;
+  const tIdx = index.findIndex((e) => e.id === tgid && e.type === "group");
+  if (tIdx === -1) return { ok: false, error: "目标标签组不存在" };
+  const { [`snap:${tgid}`]: dstSnap } = await getSnaps([tgid]);
+  if (!dstSnap || !Array.isArray(dstSnap.children)) {
+    return { ok: false, error: "目标标签组数据缺失" };
+  }
+
+  const now = Date.now();
+  const child = srcSnap.children[from];
+  const nextSrc = srcSnap.children.filter((_, k) => k !== from);
+  const pos = drop.kind === "into" ? dstSnap.children.length : drop.pos;
+  const nextDst = insertAt(dstSnap.children, pos, child);
+  const next = index.slice();
+  next[srcIdx] = { ...index[srcIdx], childCount: nextSrc.length, updatedAt: now };
+  next[tIdx] = { ...index[tIdx], childCount: nextDst.length, updatedAt: now };
+
+  await writeBatch({
+    [`snap:${gid}`]: { ...srcSnap, children: nextSrc, updatedAt: now },
+    [`snap:${tgid}`]: { ...dstSnap, children: nextDst, updatedAt: now },
+    index: next,
+    meta: buildMeta(next),
+  });
+  return { ok: true, changed: true };
+}
+
+/** 组内标签 → 提升为顶层独立标签快照。 */
+async function promoteChild(source, drop, index, srcSnap, from) {
+  const child = srcSnap.children[from];
+  // 顶层 TabSnapshot 的 url 是导出/导入校验的硬要求;历史无 url 子项(§4.11.3 D9)不允许提升
+  if (typeof child.url !== "string" || !child.url) {
+    return { ok: false, error: "该标签缺少网址,无法移到组外" };
+  }
+  if (index.some((e) => e.id === child.id)) {
+    return { ok: false, error: "该标签已存在于顶层" };
+  }
+
+  const now = Date.now();
+  const nextSrc = srcSnap.children.filter((_, k) => k !== from);
+  const entry = {
+    id: child.id,
+    type: "tab",
+    name: child.name ?? "标签",
+    url: child.url,
+    iconKey: child.iconKey ?? null,
+    updatedAt: child.updatedAt ?? now,
+  };
+  const nextDisplay = insertAt(toDisplayOrder(index), drop.pos, entry);
+  const next = toStorageOrder(nextDisplay);
+  const si = next.findIndex((e) => e.id === source.parentId);
+  if (si !== -1) next[si] = { ...next[si], childCount: nextSrc.length, updatedAt: now };
+
+  const tabSnap = {
+    id: child.id,
+    type: "tab",
+    name: entry.name,
+    url: entry.url,
+    iconKey: entry.iconKey,
+    createdAt: child.createdAt ?? now,
+    updatedAt: child.updatedAt ?? now,
+  };
+
+  await writeBatch({
+    [`snap:${source.parentId}`]: { ...srcSnap, children: nextSrc, updatedAt: now },
+    [`snap:${child.id}`]: tabSnap,
+    index: next,
+    meta: buildMeta(next),
+  });
+  return { ok: true, changed: true };
 }
