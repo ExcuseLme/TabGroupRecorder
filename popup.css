@@ -129,11 +129,17 @@ html.resizing, html.resizing * { cursor: ns-resize !important; user-select: none
   max-height: 523px;
   overflow-y: auto;
   overflow-x: hidden;
-  /* 上下 padding 大幅收紧(消除竖向浪费);左右保留 12 作为对齐基准:
-     它是 tab 按钮 / header 标题 / 行内容三者的共同左边线,归零会让行内容顶到面板边缘、
-     与上方 tab 和标题错位。滚动条本身占位(实测 10px)不遮盖内容,故右侧无需额外让位。
+  /* 左右留白基准:左侧 12px 是 tab 按钮 / header 标题 / 行内容三者的共同左边线,
+     归零会让行内容顶到面板边缘、与上方 tab 和标题错位,必须保留。
+     右侧不再写 padding-right,改用 scrollbar-gutter 预留一条「常驻滚动条带」:
+     经典滚动条出现时正好画在这条带内,行宽恒定 → 右侧按钮不再整体左移
+     (修复前实测:无滚动条时行右缘 388,出现滚动条后 373,整体左移 15px)。
+     无滚动条时该带按规范作为 padding 的延伸绘制(显示列表背景色),视觉上等同右内边距,
+     所以右侧留白 = 滚动条宽(随环境 10~15px),与左侧 12px 基本对称。
+     Chrome 94+ 支持;94 以下忽略该声明,退化为原行为(仅古老版本仍会位移)。
      底部留 4px:避免最后一行紧贴抓手(行自带 2px margin,合计 6px 呼吸空间)。 */
-  padding: 0 12px 4px;
+  padding: 0 0 4px 12px;
+  scrollbar-gutter: stable;
   background: var(--bg);
   position: relative;   /* 拖拽插入线(v0.8)的绝对定位基准 */
 }
