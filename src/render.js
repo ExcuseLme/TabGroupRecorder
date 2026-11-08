@@ -210,6 +210,11 @@ function startEdit(el, row, field = "name") {
     if (savedTitle != null) el.setAttribute("title", savedTitle);
     if (isUrl) el.removeEventListener("input", onInput);
     list.scrollLeft = 0;
+    // 元素自身的横向滚动位置也必须归零(P-49)。
+    // 编辑态 .url-input 是 overflow-x:auto,长 URL 全选后粘贴会让它滚到最右;退出编辑后
+    // overflow 变回 hidden 但 scrollLeft **仍然保留** → 内容被滚出可视区,该行显示为空白。
+    // 走"值未变"短路分支时不重建 DOM,不会被新行天然归零,所以必须在这里显式清。
+    el.scrollLeft = 0;
 
     const val = el.textContent.trim();
 

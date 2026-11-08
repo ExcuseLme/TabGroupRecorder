@@ -16,6 +16,8 @@ import { buildExportObject, triggerDownload, importOverwrite } from "./transfer.
 import { VirtualList, renderSkeleton, clearSkeleton } from "./render.js";
 import { bindRowDrag } from "./drag.js";
 import { orderForDisplay } from "./merge.js";
+import { compileSearch, planSearchRows } from "./search.js";
+import { setTslTitle, tslTitleAfterUrlEdit } from "./url.js";
 
 /** 「展开/折叠全部」按钮图标(纵向双箭头,与状态图标风格一致)。 */
 const SVG_UNFOLD_ALL = `<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3.5 6L8 2L12.5 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M3.5 10L8 14L12.5 10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
@@ -55,6 +57,7 @@ function boot() {
   bindTabs();
   bindHeaderActions();
   bindSearchInteractions();            // 搜索按钮 / 覆盖层输入 / 结果行 mousedown 保护(design-v0.6 §4)
+  bindDelConfirmCancel();              // 删除二次确认的「任何操作即回退」(需求③,纯同步,不阻塞 t0)
   bindResizeHandle();                  // 面板高度拖拽(§1.4;纯同步,不阻塞 t0)
   bindChromeRefresh();                 // 监听 Chrome 标签/分组变化 → 面板自动同步(P-29 治本,照参照 delayRefresh)
   // 面板此刻已可见;t1 紧随其后异步开始(不阻塞 t0)
@@ -213,7 +216,17 @@ async function paint() {
   try {
     const { index, ui } = await getFirstPaint();
     state.index = index;
-    state.ui = ui || { expanded: {} };
+    // 需求②(design-v1.0.0.md §2):面板每次打开都把「快照记录」的分组快照重置为「全部收起」。
+    // 触发点选「打开时」而非「关闭时」:两者在正常路径上观感完全相同,但关闭时写盘依赖
+    // pagehide,而 popup 销毁期的 storage 写链不可靠(已在本项目 P-19 踩过并放弃) ——
+    // 失效时还是静默的(分组照旧展开,无提示)。打开时执行是确定性的,且天然覆盖所有关闭方式。
+    // 必须**写盘**(不能只清内存):reloadIndex() 会把存储里的旧展开标记合并回来
+    // (`expanded: { ...storedExpanded, ...state.ui.expanded }`) → 否则任何一次捕获/删除
+    // 都会让几个分组突然自己展开。只在原本非空时写,常态打开零写入。
+    // 保留 ui 的其它字段(panelHeight 等)。
+    const hadExpanded = Object.keys(ui?.expanded || {}).length > 0;
+    state.ui = { ...(ui || {}), expanded: {} };
+    if (hadExpanded) { try { chrome.storage.local.set({ ui: state.ui }); } catch { /* 忽略 */ } }
     state.tab = "current";   // 每次展开面板始终进入「当前标签」(问题1)
     // §1.6:应用上次拖拽保存的高度(必须在 t1 之后 —— t0 零 await 不能读 storage)
     if (state.ui.panelHeight) applyH(state.ui.panelHeight);
@@ -465,23 +478,96 @@ function isDupContent(content, selfId) {
 // 0.7.2:打开一律在后台(不转移焦点 → 面板保持开启),不再区分修饰键。
 const OPEN_TITLE = "打开(后台打开)";
 
-/** 快照记录操作按钮工厂:普通行与搜索投影行共用,避免行为分叉。 */
+/* ============ 需求③:删除的二次确认(design-v1.0.0.md §3) ============
+   交互:点「删除」→ 该按钮**原地**变实心红「确认」→ 必须再点**同一按钮**才真正删除;
+   期间**任何其它操作**(点别处 / 按键 / 滚轮 / 右键 / 输入 / 拖面板 / 拖行 / 重渲染)立刻退回「删除」。
+   不设自动回退时长(D12 使用者定案)。
+
+   状态模型:确认态**只活在按钮 DOM 节点上**,不进模型、不进 state。
+   理由:两次点击之间正常不会重渲染(渲染只由切 tab / 搜索输入 / 捕获 / 删除 / 改名触发)。
+   于是「重渲染 → 旧节点销毁 → 确认态自动消失」天然成立,不会出现
+   「看着是删除、点下去却直接删」或「显示确认但底层已换行」的错位 ——
+   代价只是重渲染后需重新点两次,而失败方向是安全的(fail-closed)。 */
+let delConfirm = { btn: null, label: "删除", title: "" };
+
+/** 退回「删除」态(幂等)。节点已被重渲染销毁时无需还原。 */
+function cancelDelConfirm() {
+  const d = delConfirm;
+  if (!d.btn) return;
+  delConfirm = { btn: null, label: "删除", title: "" };
+  if (!d.btn.isConnected) return;          // 旧节点已销毁 → 新节点本来就是「删除」态
+  d.btn.classList.remove("confirm");
+  d.btn.textContent = d.label;
+  d.btn.title = d.title;
+}
+
+/**
+ * 删除按钮点击:第一次 → 进入确认态;第二次(同一按钮)→ 执行删除。
+ * @param {MouseEvent} e render.js 的 click 监听透传的事件(此处 currentTarget 就是该按钮)
+ * @param {() => any} run 真正的删除动作
+ */
+function onDeleteClick(e, run) {
+  const btn = e.currentTarget;
+  if (!btn) return;
+  if (delConfirm.btn === btn) {            // 第二次点同一按钮 → 真正删除
+    cancelDelConfirm();
+    void run();
+    return;
+  }
+  cancelDelConfirm();                      // 回退其它行(结构上保证同时只有一行处于确认态)
+  delConfirm = { btn, label: btn.textContent, title: btn.title };
+  btn.classList.add("confirm");
+  btn.textContent = "确认";
+  btn.title = "再次点击确认删除";
+}
+
+/**
+ * 绑定「任何操作即回退」的全局监听(design-v1.0.0.md §3.4)。
+ * 两个**必需例外**,否则第二次点击会被自己取消掉、退化成「永远删不掉」:
+ *  ① 点【确认】按钮自身 → 不取消(交给 click 执行删除);
+ *  ② Enter/Space 作用在【确认】按钮上 → 视为「确认」,不取消。
+ */
+function bindDelConfirmCancel() {
+  document.addEventListener("pointerdown", (e) => {
+    const b = delConfirm.btn;
+    if (!b || b.contains(e.target)) return;      // 例外①
+    cancelDelConfirm();
+  }, true);
+
+  document.addEventListener("keydown", (e) => {
+    const b = delConfirm.btn;
+    if (!b) return;
+    if ((e.key === "Enter" || e.key === " ") && (e.target === b || b.contains(e.target))) return;  // 例外②
+    cancelDelConfirm();
+  }, true);
+
+  // 其余"任何操作":滚轮 / 右键菜单 / 文本输入
+  for (const ev of ["wheel", "contextmenu", "input"]) {
+    document.addEventListener(ev, () => { if (delConfirm.btn) cancelDelConfirm(); }, true);
+  }
+  // 滚动(含拖动滚动条):用 scroll 事件,不依赖 wheel
+  document.getElementById("list").addEventListener("scroll",
+    () => { if (delConfirm.btn) cancelDelConfirm(); }, { capture: true, passive: true });
+}
+
+/** 快照记录操作按钮工厂:普通行与搜索投影行共用,避免行为分叉。
+    删除按钮统一走 onDeleteClick 做二次确认(需求③)。 */
 function recordGroupButtons(id) {
   return [
     { cls: "open", label: "打开", title: OPEN_TITLE, onClick: () => doOpenGroup(id) },
-    { cls: "del", label: "删除", onClick: () => doDelete(id) },
+    { cls: "del", label: "删除", onClick: (e) => onDeleteClick(e, () => doDelete(id)) },
   ];
 }
 function recordTabButtons(id) {
   return [
     { cls: "open", label: "打开", title: OPEN_TITLE, onClick: () => doOpenTab(id) },
-    { cls: "del", label: "删除", onClick: () => doDelete(id) },
+    { cls: "del", label: "删除", onClick: (e) => onDeleteClick(e, () => doDelete(id)) },
   ];
 }
 function recordChildButtons(parentId, childId) {
   return [
     { cls: "open", label: "打开", title: OPEN_TITLE, onClick: () => doOpenChild({ id: childId, parentId }) },
-    { cls: "del", label: "删除", onClick: () => doDeleteChild({ id: childId, parentId }) },
+    { cls: "del", label: "删除", onClick: (e) => onDeleteClick(e, () => doDeleteChild({ id: childId, parentId })) },
   ];
 }
 
@@ -512,16 +598,25 @@ function bindRecordRow(r) {
   };
 }
 
-/** 同步更新内存 state.index 中该条的名称(避免 async 重读 storage 的中间态)。 */
+/** 同步更新内存 state.index 中该条的名称(避免 async 重读 storage 的中间态)。
+ *  design-v1.1.0:若该条的 url 是 TSL 占位页,改名同时把 url 里的 title 参数改写掉,
+ *  index / recordsRows 两处缓存一起更新(render.js 渲染的是 recordsRows 的 url)。 */
 function renameIndexEntry(id, name) {
   const i = state.index.findIndex((e) => e.id === id);
   if (i !== -1) {
     const next = state.index.slice();
-    next[i] = { ...next[i], name, updatedAt: Date.now() };
+    const entry = { ...next[i], name, updatedAt: Date.now() };
+    const url = setTslTitle(entry.url ?? "", name);
+    if (url !== (entry.url ?? "")) entry.url = url;
+    next[i] = entry;
     state.index = next;
   }
   const cached = state.recordsRows.find((t) => t.id === id);
-  if (cached) cached.name = name;
+  if (cached) {
+    cached.name = name;
+    // 顶层行 url 非空才同步(分组行没有 url 字段,不能凭空造出第二行)
+    if (cached.url != null) cached.url = setTslTitle(cached.url, name);
+  }
 }
 
 /** 快照记录·组内子标签行。 */
@@ -532,7 +627,11 @@ function toRecordChildRow(c, parentId) {
     onRename: (v) => renameChild(parentId, c.id, v),
     onRenamed: (v) => {                                   // 同步缓存(P-17)
       const x = state.recordsRows.find((t) => t.id === c.id);
-      if (x) x.name = v;
+      if (x) {
+        x.name = v;
+        // design-v1.1.0:TSL 占位页 URL 的 title 参数随标题同步(渲染读的是本行 url)
+        if (x.url != null) x.url = setTslTitle(x.url, v);
+      }
     },
     onRefresh: () => refreshRecordsSync(),                // 同步整 tab 刷新(P-18/22)
     onFlush: (v) => flushChild(parentId, c.id, v),        // pagehide 补偿(P-19)
@@ -544,9 +643,11 @@ function toRecordChildRow(c, parentId) {
   };
 }
 
-/* ============ 快照记录·正则搜索(design-v0.6 §4) ============ */
+/* ============ 快照记录·正则搜索(design-v0.6 §4;规则由 design-v1.0.0 §4 取代) ============ */
 // 纪律:搜索本身不写 storage;结果为只读投影行,展开只写临时 state.search.expanded。
-// 匹配字段:组标题 / 组内标签标题、url / 顶层标签标题、url;new RegExp(q,"i"),不用 g。
+// 匹配/过滤/默认展开的**纯逻辑**在 src/search.js(可在 selftest.html 直接断言),
+// 本文件只负责:行工厂(绑定按钮)、渲染、焦点与交互。
+// 匹配字段:组名 / 组内标签名称与 url / 顶层标签名称与 url;new RegExp(q,"i"),不用 g。
 
 let searchTimer = null;
 
@@ -557,15 +658,7 @@ function searchEls() {
   };
 }
 
-function compileSearch(q) {
-  if (!q) return { re: null };
-  try { return { re: new RegExp(q, "i") }; }
-  catch { return { error: "正则表达式无效" }; }
-}
-
-function searchMatch(re, value) {
-  return re.test(value ?? "");
-}
+// compileSearch / searchMatch 来自 src/search.js(纯函数模块),此处不再重复定义。
 
 /** 搜索投影行:只读、不绑编辑/持久化展开;打开/删除沿用普通行行为。 */
 function toSearchGroupRow(e, expanded) {
@@ -613,40 +706,23 @@ async function ensureSearchSnaps() {
 }
 
 /**
- * 构建搜索投影列表(§4.5):
- *  - 顶层标签:标题或 url 命中;
- *  - 组:组标题命中或任一子标签命中;有 url 查询时,子标签只显示命中项,
- *        组标题命中则视为整组命中(展开后显示全部子标签);
- *  - 空查询:不过滤,展开态沿用 ui.expanded(视觉等同正常列表)。
+ * 构建搜索投影列表:纯逻辑委托给 src/search.js 的 planSearchRows(可单测),
+ * 这里只把「行计划」映射成带按钮的只读投影行。
  */
 function buildSearchFlat() {
   const s = state.search;
-  const re = s.re;
+  const plan = planSearchRows({
+    entries: orderForDisplay(state.index),
+    snaps: s.snaps,
+    re: s.re,
+    expandedOverride: s.expanded,
+    uiExpanded: state.ui.expanded,
+  });
   const out = [];
-  for (const e of orderForDisplay(state.index)) {
-    if (e.type === "tab") {
-      if (re && !searchMatch(re, e.name) && !searchMatch(re, e.url)) continue;
-      out.push(toSearchTabRow(e));
-      continue;
-    }
-
-    const snap = s.snaps?.[`snap:${e.id}`];
-    const children = snap?.children || [];
-    const titleHit = !re || searchMatch(re, e.name);
-    const hits = re
-      ? children.filter((c) => searchMatch(re, c.name) || searchMatch(re, c.url))
-      : children;
-    if (re && !titleHit && !hits.length) continue;
-
-    const expanded = Object.prototype.hasOwnProperty.call(s.expanded, e.id)
-      ? !!s.expanded[e.id]
-      : (re ? hits.length > 0 : !!state.ui.expanded[e.id]);
-    out.push(toSearchGroupRow(e, expanded));
-    if (expanded) {
-      // 组标题命中 = 整组命中 → 展开显示全部子标签;仅子标签命中 → 只显示命中子行
-      const visible = re && !titleHit ? hits : children;
-      for (const c of visible) out.push(toSearchChildRow(c, e.id));
-    }
+  for (const it of plan) {
+    if (it.kind === "tab") out.push(toSearchTabRow(it.entry));
+    else if (it.kind === "group") out.push(toSearchGroupRow(it.entry, it.expanded));
+    else out.push(toSearchChildRow(it.child, it.parentId));
   }
   return out;
 }
@@ -702,6 +778,7 @@ function showSearchOverlay(show) {
 async function enterSearch() {
   const s = state.search;
   if (s.active || state.tab !== "records") return;
+  cancelDelConfirm();                  // 需求③:进入搜索前清掉确认态(行即将被搜索投影行替换)
   s.active = true;
   s.gen++;
   s.query = "";
@@ -728,6 +805,7 @@ async function enterSearch() {
 function exitSearch({ rerender = true } = {}) {
   const s = state.search;
   if (!s.active) return;
+  cancelDelConfirm();                  // 需求③:退出搜索清掉确认态(行即将被全量列表替换)
   const prev = s.prevScroll || 0;
   s.gen++;
   s.active = false;
@@ -790,9 +868,18 @@ function bindSearchInteractions() {
     exitSearch();
     input.blur();
   });
+  // 搜索态下,列表区域的 mousedown 一律取消默认聚焦(保住输入框焦点),而非只保护「行内」。
+  //
+  // 为什么要扩到整块列表:用户常拖「原生滚动条」快速翻看很多结果,而鼠标按在滚动条上时
+  // #list(tabindex="0",可聚焦)会抢走焦点 → input blur → 直接退出搜索。
+  // 实测(CDP 真实鼠标事件):现状「拖滚动条 → blur=1」;改为整块 preventDefault 后 blur=0。
+  // 安全性也已实测:在滚动条上 preventDefault **不会**破坏拖拽滚动
+  // (A/B 对照两种模式下 scrollTop 均到 1197),因为滚动条拖拽由浏览器内部机制驱动,
+  // 不依赖 mousedown 的默认动作。
+  // 行内点击本来就 preventDefault,合到一处后行为等价;滚动条/列表空白也随之受保护。
   document.getElementById("list").addEventListener("mousedown", (e) => {
     if (!state.search.active) return;
-    if (e.target.closest(".row")) e.preventDefault();
+    e.preventDefault();
   }, true);
   // 搜索态点击「展开/收起全部」也不能让输入框失焦,否则 click 前已退出搜索、作用到全量列表
   document.getElementById("btn-fold-all").addEventListener("mousedown", (e) => {
@@ -851,7 +938,8 @@ async function doOpenChild(row) {
 }
 
 /* ============ §2.4 URL 编辑 ============ */
-/** 顶层标签快照改 URL:写盘 + 同步缓存 + 同步重建列表(P-18/P-22 纪律)。 */
+/** 顶层标签快照改 URL:写盘 + 同步缓存 + 同步重建列表(P-18/P-22 纪律)。
+ *  design-v1.1.0:URL 是 TSL 占位页且 title 参数有变时,标题一并联动(写盘由 operations 完成)。 */
 async function doEditUrlTop(id, url) {
   const r = await updateTabUrl(id, url);
   if (!r.ok) return r;
@@ -859,11 +947,16 @@ async function doEditUrlTop(id, url) {
   const i = state.index.findIndex((e) => e.id === id);
   if (i !== -1) {
     const next = state.index.slice();
-    next[i] = { ...next[i], url: r.url, updatedAt: Date.now() };
+    const entry = { ...next[i], url: r.url, updatedAt: Date.now() };
+    if (r.name != null) entry.name = r.name;
+    next[i] = entry;
     state.index = next;
   }
   const cached = state.recordsRows.find((t) => t.id === id);
-  if (cached) cached.url = r.url;
+  if (cached) {
+    cached.url = r.url;
+    if (r.name != null) cached.name = r.name;
+  }
   refreshRecordsSync();
   return { ok: true };
 }
@@ -873,7 +966,10 @@ async function doEditUrlChild(groupId, childId, url) {
   const r = await updateChildUrl(groupId, childId, url);
   if (!r.ok) return r;
   const cached = state.recordsRows.find((t) => t.id === childId);
-  if (cached) cached.url = r.url;
+  if (cached) {
+    cached.url = r.url;
+    if (r.name != null) cached.name = r.name;
+  }
   refreshRecordsSync();
   return { ok: true };
 }
@@ -893,17 +989,27 @@ async function doDeleteChild(row) {
   }
 }
 
-/** 组内标签重命名:仅改 snap.children 中对应项,不改 index(其他问题2)。 */
+/** 组内标签重命名:仅改 snap.children 中对应项,不改 index(其他问题2)。
+ *  design-v1.1.0:TSL 占位页 url 的 title 参数随标题同步。 */
 async function renameChild(groupId, childId, name) {
   const { [`snap:${groupId}`]: snap } = await getSnaps([groupId]);
   if (!snap || snap.type !== "group") return { ok: false };
-  const children = snap.children.map((c) => c.id === childId ? { ...c, name } : c);
+  const children = snap.children.map((c) => {
+    if (c.id !== childId) return c;
+    const next = { ...c, name };
+    const url = setTslTitle(c.url ?? "", name);
+    if (url !== (c.url ?? "")) next.url = url;
+    return next;
+  });
   await writeBatch({
     [`snap:${groupId}`]: { ...snap, children, updatedAt: Date.now() },
   });
   // 同步缓存,避免切 tab 后回退为旧标题(其他问题2.1)
   const cached = state.recordsRows.find((r) => r.id === childId);
-  if (cached) cached.name = name;
+  if (cached) {
+    cached.name = name;
+    if (cached.url != null) cached.url = setTslTitle(cached.url, name);
+  }
   return { ok: true };
 }
 async function toggleExpand(id) {
@@ -944,6 +1050,9 @@ function expandGroupForDrag(groupId) {
  * 顶层快照(独立标签/组):pagehide 时**同步**读改写,不走 renameSnapshot 的异步读链。
  * chrome.storage.local.get/set 是 Promise 但本地即取,popup 销毁前足以完成;
  * 若极端情况下未完成,下次 renderRecords 由 pendingChild 同思路兜底(此处直接覆盖 index)。
+ *
+ * design-v1.1.0:标题改名时若 url 是 TSL 占位页,url 里的 title 参数在这里**一并**改写,
+ * 保证「改完标题立刻关面板」这条最快路径也落成一致的 index+snap(否则只落标题、丢联动)。
  */
 function flushTopLevel(id, name) {
   try {
@@ -953,9 +1062,20 @@ function flushTopLevel(id, name) {
       const snap = data[`snap:${id}`];
       const now = Date.now();
       const next = index.slice();
-      if (i !== -1) next[i] = { ...index[i], name, updatedAt: now };
+      if (i !== -1) {
+        const entry = { ...index[i], name, updatedAt: now };
+        // 旧 url:快照详情是写盘的事实源,index 只做兜底(历史上两者可能不同步)
+        const oldUrl = snap?.url ?? index[i].url ?? "";
+        const url = setTslTitle(oldUrl, name);
+        if (url !== oldUrl) entry.url = url;
+        next[i] = entry;
+      }
       const batch = { index: next, meta: buildMetaLocal(next) };
-      if (snap) batch[`snap:${id}`] = { ...snap, name, updatedAt: now };
+      if (snap) {
+        const url = setTslTitle(snap.url ?? "", name);
+        batch[`snap:${id}`] = { ...snap, name, updatedAt: now };
+        if (url !== (snap.url ?? "")) batch[`snap:${id}`].url = url;
+      }
       chrome.storage.local.set(batch, () => {});
     });
   } catch (e) { console.error("flushTopLevel 失败", e); }
@@ -971,7 +1091,8 @@ function flushChild(groupId, childId, name) {
 /** 待应用的组内改名(pagehide 后补偿)。 */
 const pendingChildEdits = new Map();
 
-/** 在 renderRecords 前应用所有 pending 组内改名,保证下次打开显示新名(P-19)。 */
+/** 在 renderRecords 前应用所有 pending 组内改名,保证下次打开显示新名(P-19)。
+ *  design-v1.1.0:TSL 占位页的 title 参数一并改写(与顶层 flushTopLevel 对称)。 */
 async function applyPendingChildEdits() {
   if (!pendingChildEdits.size) return;
   const edits = [...pendingChildEdits.values()];
@@ -981,7 +1102,13 @@ async function applyPendingChildEdits() {
       const data = await getSnaps([e.groupId]);
       const snap = data[`snap:${e.groupId}`];
       if (!snap || snap.type !== "group") continue;
-      const children = snap.children.map((c) => c.id === e.childId ? { ...c, name: e.name } : c);
+      const children = snap.children.map((c) => {
+        if (c.id !== e.childId) return c;
+        const next = { ...c, name: e.name };
+        const url = setTslTitle(c.url ?? "", e.name);
+        if (url !== (c.url ?? "")) next.url = url;
+        return next;
+      });
       await writeBatch({ [`snap:${e.groupId}`]: { ...snap, children, updatedAt: Date.now() } });
     } catch (err) { console.error("补偿组内改名失败", err); }
   }
@@ -1012,6 +1139,7 @@ function bindTabs() {
       const t = btn.dataset.tab;
       if (t === state.tab) return;
       exitSearch({ rerender: false });   // 切 tab 显式退出搜索(不依赖 blur 副作用)
+      cancelDelConfirm();                // 需求③:切 tab 清掉删除确认态(兜底,清悬空引用)
       state.tab = t;
       syncTabs();
       // 不再持久化 activeTab(问题1:每次展开始终回到当前标签)

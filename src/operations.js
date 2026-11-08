@@ -6,7 +6,7 @@ import {
   ensureIcon, buildMeta,
 } from "./storage.js";
 import { currentWindowId } from "./capture.js";
-import { urlCandidates, isBookmarklet, valueToSave } from "./url.js";
+import { urlCandidates, isBookmarklet, valueToSave, setTslTitle, tslTitleAfterUrlEdit } from "./url.js";
 import {
   mergeGroupChildren, insertAt, moveWithin,
   toDisplayOrder, toStorageOrder, sameIdOrder,
@@ -325,7 +325,9 @@ async function openGroupByName(name, color, urls) {
 /* ================= URL 编辑(§2.5) ================= */
 // 纪律:仅 valueToSave 的非空校验,不做格式/协议校验、不做重复拦截(§2.6 / §2.7)。
 
-/** 独立标签快照改 URL:index 与 snap 双写(与 renameSnapshot 一致)。 */
+/** 独立标签快照改 URL:index 与 snap 双写(与 renameSnapshot 一致)。
+ *  design-v1.1.0:URL → 标题联动 —— 新 URL 是 TSL 占位页且其 title 参数有变化时,
+ *  一并把快照标题同步为该 title(见 src/url.js#tslTitleAfterUrlEdit)。 */
 export async function updateTabUrl(id, url) {
   const v = valueToSave(url);
   if (!v.ok) return v;
@@ -337,17 +339,24 @@ export async function updateTabUrl(id, url) {
   if (!snap) return { ok: false, error: "未找到" };
 
   const now = Date.now();
+  // 联动判定用「编辑前的 url」:顶层以 snap 为准,历史上两者可能不同步,故再兜底 index
+  const synced = tslTitleAfterUrlEdit(snap.url ?? index[i].url ?? "", v.value);
+
   const next = index.slice();
-  next[i] = { ...index[i], url: v.value, updatedAt: now };
+  const nextEntry = { ...index[i], url: v.value, updatedAt: now };
+  const nextSnap = { ...snap, url: v.value, updatedAt: now };
+  if (synced != null) { nextEntry.name = synced; nextSnap.name = synced; }
+  next[i] = nextEntry;
   await writeBatch({
-    [`snap:${id}`]: { ...snap, url: v.value, updatedAt: now },
+    [`snap:${id}`]: nextSnap,
     index: next,
     meta: buildMeta(next),
   });
-  return { ok: true, url: v.value };
+  return { ok: true, url: v.value, name: nextEntry.name };
 }
 
-/** 组内标签快照改 URL:只写 snap.children,不动 index(与 renameChild 一致)。 */
+/** 组内标签快照改 URL:只写 snap.children,不动 index(与 renameChild 一致)。
+ *  design-v1.1.0:URL → 标题联动同 updateTabUrl。 */
 export async function updateChildUrl(groupId, childId, url) {
   const v = valueToSave(url);
   if (!v.ok) return v;
@@ -356,16 +365,28 @@ export async function updateChildUrl(groupId, childId, url) {
   if (!snap || snap.type !== "group") return { ok: false, error: "未找到" };
 
   const now = Date.now();
-  const children = snap.children.map((c) =>
-    c.id === childId ? { ...c, url: v.value, updatedAt: now } : c);
+  const old = (snap.children || []).find((c) => c.id === childId);
+  if (!old) return { ok: false, error: "未找到" };
+  const synced = tslTitleAfterUrlEdit(old.url ?? "", v.value);
+
+  let nextName = old.name;
+  const children = snap.children.map((c) => {
+    if (c.id !== childId) return c;
+    const next = { ...c, url: v.value, updatedAt: now };
+    if (synced != null) { next.name = synced; nextName = synced; }
+    return next;
+  });
   await writeBatch({
     [`snap:${groupId}`]: { ...snap, children, updatedAt: now },
   });
-  return { ok: true, url: v.value };
+  return { ok: true, url: v.value, name: nextName };
 }
 
 /* ================= §7 重命名 ================= */
 
+/** 顶层快照改名(index + snap 双写)。
+ *  design-v1.1.0:若该条是标签快照且 url 是 TSL 占位页,url 里的 title 参数同步改写。
+ *  注:快照记录的就地改名实际走 popup.js#flushTopLevel(pagehide 同步链),本函数保持与之一致。 */
 export async function renameSnapshot(id, name) {
   const index = await loadIndex();
   const i = index.findIndex((e) => e.id === id);
@@ -374,13 +395,19 @@ export async function renameSnapshot(id, name) {
   if (!snap) return { ok: false, error: "未找到" };
   const now = Date.now();
   const next = index.slice();
-  next[i] = { ...index[i], name, updatedAt: now };
+  const entry = { ...index[i], name, updatedAt: now };
+  const nextSnap = { ...snap, name, updatedAt: now };
+  // 分组快照没有 url,setTslTitle 会原样返回
+  const oldUrl = snap.url ?? index[i].url ?? "";
+  const url = setTslTitle(oldUrl, name);
+  if (url !== oldUrl) { entry.url = url; nextSnap.url = url; }
+  next[i] = entry;
   await writeBatch({
-    [`snap:${id}`]: { ...snap, name, updatedAt: now },
+    [`snap:${id}`]: nextSnap,
     index: next,
     meta: buildMeta(next),
   });
-  return { ok: true };
+  return { ok: true, url };
 }
 
 /* ================= §8 删除 ================= */

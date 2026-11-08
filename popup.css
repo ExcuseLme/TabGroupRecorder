@@ -81,9 +81,33 @@ html.resizing, html.resizing * { cursor: ns-resize !important; user-select: none
 }
 .title-group { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .title { font-size: 16px; font-weight: 600; white-space: nowrap; }
-/* 展开/折叠全部按钮:紧邻主标题右方;hover 提示用浏览器原生 title(见下,移除自绘 tip) */
-.title-group .fold-all { width: 22px; height: 22px; color: var(--text-2); }
-.title-group .fold-all:hover { background: #eef0f3; color: var(--text); }
+/* 展开/折叠全部按钮:紧邻主标题右方;hover 提示用浏览器原生 title(见下,移除自绘 tip)
+   flex-shrink:0 —— 不加则「快照记录」tab 的副标题变长会把它压到 18.64px(非设计值 22),
+   使下面 ::before 的命中区左右不对称(实测数据见 design-v1.0.0.md §1.8)。
+
+   P-52:命中区宽度与「列表内分组 <> 按钮」**完全一致**(32px),不是"面积不小于"。
+   列表那个:16px 图标 + inset -14px -8px → 32 宽 × 44 高。
+   本按钮图标 22×22 → 水平取 -5px 得 32 宽(22+5×2),与列表**同宽**;
+   垂直取 -7px 得 36 高(22+7×2),已铺满 header 的 37px,是该位置的物理上限。
+
+   为什么不能更宽(上一版取 -12px 是错的):
+   按钮左缘 82 距主标题右缘 76 仅 6px、右缘 104 距副标题左缘 110 仅 6px。
+   取 -12px 会让命中区横跨 70..116,**左右各压住文字 6px**,悬停时灰底盖住邻接内容
+   (使用者实测反馈)。取 -5px 后命中区为 77..109,精确落在两段留白之内,不碰任何文字。
+
+   ⚠️ 关键:hover 底色必须挂在 ::before 上(不是按钮本体)。
+   此前写的是 `.fold-all:hover { background }` —— 底色只有按钮本体的 22×22,
+   外扩出来的命中区完全看不见,于是"改大了却感觉不出来"(实测命中区一直是够的)。
+   现在与列表那个 `.state-icon:hover::before` 用同一手法,悬停即可看到整块命中区。
+   同理 svg 需 position:relative,否则 ::before 会盖住图标(与列表图标同一坑)。 */
+.title-group .fold-all { width: 22px; height: 22px; color: var(--text-2); flex-shrink: 0; }
+.title-group .fold-all svg { display: block; position: relative; }   /* 不被 ::before 盖住 */
+.title-group .fold-all:hover { color: var(--text); }
+.title-group .fold-all::before {
+  content: ""; position: absolute; inset: -7px -5px;   /* 22×22 → 32 宽 × 36 高(与列表按钮同宽) */
+  border-radius: 6px;
+}
+.title-group .fold-all:hover::before { background: #eef0f3; }
 .subtitle { font-size: 11px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .actions { display: flex; gap: 8px; flex-shrink: 0; position: relative; }
 .actions[hidden] { display: none; }
@@ -194,9 +218,14 @@ html.resizing, html.resizing * { cursor: ns-resize !important; user-select: none
    框(.url-field)与文本(.url-input)分离:边框挂在框上,不随文本内部滚动而抖动 */
 .url-field {
   display: flex; align-items: center; min-width: 0;
+  /* 左对齐修正(P-50):框带 `border 1px + padding-left 4px` = 文字被右推 5px,
+     而上面的标题没有这个偏移,两行左缘就错开 5px。用等量负外边距把整块向左拉 5px,
+     文字正好回到标题的左缘(x 对齐),框本身仍向两侧各多探出 5px —— 悬停底色、
+     蓝框(编辑态)、黄框+气泡(重复提示)的视觉都不变,只是框比文字宽一圈。 */
   padding: 1px 4px; border-radius: 4px; position: relative;
   border: 1px solid transparent;   /* 常态:透明边框占位,换色时无布局位移 */
   background: transparent;
+  margin: 0 -5px;                  /* 抵消左右各 5px(border 1 + padding 4) */
 }
 .url-input {
   min-width: 0; flex: 1 1 auto;
@@ -233,9 +262,33 @@ html.resizing, html.resizing * { cursor: ns-resize !important; user-select: none
 
 .row-tools { display: flex; gap: 6px; flex-shrink: 0; }
 
-/* 状态图标 <> / >< */
-.state-icon { flex-shrink: 0; color: var(--icon); display: grid; place-items: center; cursor: pointer; }
-.state-icon svg { display: block; }
+/* 状态图标 <> / ><
+   命中区 = 整个行高(design-v1.0.0.md 需求①;1.0.1 起垂直铺满行高):「展开/收起」是高频操作,
+   16×16 太难点中、24×24 仍嫌小 —— 现在垂直方向直接铺满行内容高度。
+   实测几何:组行 44px、图标 16px 垂直完美居中 → 上下各需外扩 (44-16)/2 = **14px**。
+
+   水平方向**左右不对称**(P-53):
+     图标盒 [48,64];左邻 .dot 右缘 = 40(可扩 8px);右邻 .row-title 左缘 = 70(只有 6px)。
+   此前用对称的 -8px,右侧会探到 x=72 → **比标题左缘多出 2px,悬停灰底压住分组名最左 2px**
+   (使用者发现的细微 UI 问题)。现改为分别吃满各自上限:
+     left  -8px → 40(恰好贴住 .dot,不覆盖)
+     right -6px → 70(恰好贴住标题左缘,不压文字)
+   → 30 宽 × 44 高。宽度比原来少 2px,但换来「不遮挡任何相邻内容」,视觉更干净。
+
+   用绝对定位的 ::before 外扩 —— 伪元素脱离文档流、不参与 grid/flex 排布
+   → 视觉与布局零变化(实测图标盒仍 16×16、标题左缘仍 x=70、行高仍 44、header 仍 37)。
+   行距 2px,故 44px 高不会与相邻行的命中区重叠。
+   ⚠️ svg 必须 position:relative —— ::before 是定位元素,会压在静态 SVG 之上,
+      不加这一行 hover 底色会把整个图标盖住(实测,见 design-v1.0.0.md §1.4)。
+   注:.state-icon 原无任何 hover 反馈,这里补浅灰底让命中区可见。 */
+.state-icon { flex-shrink: 0; color: var(--icon); display: grid; place-items: center; cursor: pointer; position: relative; }
+.state-icon svg { display: block; position: relative; }
+.state-icon::before {
+  content: ""; position: absolute; inset: -14px -6px -14px -8px;   /* 30 宽 × 44 高 */
+  border-radius: 4px;
+}
+.state-icon:hover::before { background: #eef0f3; }
+.state-icon:hover { color: var(--text); }
 
 /* 按钮 */
 .btn {
@@ -245,6 +298,11 @@ html.resizing, html.resizing * { cursor: ns-resize !important; user-select: none
 .btn.cap { background: var(--cap-bg); color: var(--cap-fg); }
 .btn.open { background: var(--open-bg); color: var(--cap-fg); }
 .btn.del { background: var(--del-bg); color: var(--del-fg); }
+/* 删除二次确认态(design-v1.0.0.md 需求③):点「删除」后该按钮原地变实心红「确认」,
+   再点一次才真正删除;期间任何其它操作立刻退回「删除」。
+   只换配色、不改尺寸 ——「删除」与「确认」同为 2 个中文字,
+   实测按钮宽恒为 40px、.row-tools 恒 86px、「打开」左缘恒 x=291,故零布局位移。 */
+.btn.del.confirm { background: var(--del-fg); color: #fff; font-weight: 600; }
 .btn:disabled { opacity: .5; cursor: default; }
 
 /* ===== 行拖拽排序(v0.8,design-v0.8.md §5) =====
